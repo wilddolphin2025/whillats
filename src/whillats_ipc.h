@@ -14,6 +14,7 @@ enum MsgType : uint8_t {
     MSG_WHISPER_AUDIO      = 0x03,
     MSG_WHISPER_RESULT     = 0x04,
     MSG_WHISPER_LANGUAGE   = 0x05,
+    MSG_WHISPER_TRANSCRIPT = 0x06,  // payload: 'I'|'F', language, '\t', text
 
     MSG_LLAMA_START        = 0x10,
     MSG_LLAMA_STOP         = 0x11,

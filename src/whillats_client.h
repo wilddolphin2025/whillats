@@ -23,6 +23,7 @@ public:
 
     void setWhisperCallback(ResponseCallback cb, void* ud) { std::lock_guard<std::mutex> l(_cbMutex); _whisperFn = cb; _whisperUd = ud; }
     void setLanguageCallback(LanguageCallback cb, void* ud) { std::lock_guard<std::mutex> l(_cbMutex); _langFn = cb; _langUd = ud; }
+    void setTranscriptCallback(TranscriptCallback cb, void* ud) { std::lock_guard<std::mutex> l(_cbMutex); _transcriptFn = cb; _transcriptUd = ud; }
     void setLlamaCallback(ResponseCallback cb, void* ud) { std::lock_guard<std::mutex> l(_cbMutex); _llamaFn = cb; _llamaUd = ud; }
     void setTtsCallback(AudioCallback cb, void* ud) { std::lock_guard<std::mutex> l(_cbMutex); _ttsFn = cb; _ttsUd = ud; }
 
@@ -30,6 +31,7 @@ public:
         std::lock_guard<std::mutex> l(_cbMutex);
         _whisperFn = nullptr; _whisperUd = nullptr;
         _langFn = nullptr; _langUd = nullptr;
+        _transcriptFn = nullptr; _transcriptUd = nullptr;
         _llamaFn = nullptr; _llamaUd = nullptr;
         _ttsFn = nullptr; _ttsUd = nullptr;
     }
@@ -49,6 +51,8 @@ private:
     void* _whisperUd = nullptr;
     LanguageCallback _langFn = nullptr;
     void* _langUd = nullptr;
+    TranscriptCallback _transcriptFn = nullptr;
+    void* _transcriptUd = nullptr;
     ResponseCallback _llamaFn = nullptr;
     void* _llamaUd = nullptr;
     AudioCallback _ttsFn = nullptr;

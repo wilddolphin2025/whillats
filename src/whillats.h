@@ -28,6 +28,14 @@
 typedef void (*ResponseCallback)(bool success, const char* response, void* user_data);
 typedef void (*AudioCallback)(bool success, const uint16_t* buffer, size_t buffer_size, void* user_data);
 typedef void (*LanguageCallback)(bool success, const char* language, void* user_data);
+// Streaming STT: interim hypotheses (is_final == false) refine while the user
+// speaks; exactly one final result (is_final == true) is emitted per utterance.
+typedef void (*TranscriptCallback)(const char* text, bool is_final, const char* language, void* user_data);
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// iOS forbids spawning helper processes: run Whisper/Llama inside the app.
+#define WHILLATS_INPROCESS 1
+#endif
 
 struct clip_image_u8 {
     int width;
@@ -47,6 +55,8 @@ struct YUVData {
 };
 
 class WhillatsSpeechSynthesizerWrapper;
+class WhisperTranscriber;
+class LlamaDeviceBase;
 class Synthesis;
 class WhillatsServerConnection;
 class WhillatsTranscriberClient;
@@ -104,6 +114,19 @@ public:
     void* user_data_;
 };
 
+class WHILLATS_API WhillatsSetTranscriptCallback {
+public:
+    WhillatsSetTranscriptCallback(TranscriptCallback callback = nullptr, void* user_data = nullptr)
+        : callback_(callback), user_data_(user_data) {}
+
+    void OnTranscript(const char* text, bool is_final, const char* language) const {
+        if (callback_) callback_(text, is_final, language, user_data_);
+    }
+
+    TranscriptCallback callback_;
+    void* user_data_;
+};
+
 class WHILLATS_API WhillatsTTS {
   public:
     WhillatsTTS(WhillatsSetAudioCallback callback);
@@ -123,8 +146,10 @@ class WHILLATS_API WhillatsTTS {
 
   private:
     WhillatsSetAudioCallback _callback;
+#ifndef WHILLATS_INPROCESS
     std::shared_ptr<WhillatsServerConnection> _conn;
     std::unique_ptr<WhillatsTTSClient> _ttsClient;
+#endif
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     std::unique_ptr<WhillatsSpeechSynthesizerWrapper> _wrapper;
 #elif defined(__APPLE__) && TARGET_OS_OSX
@@ -147,14 +172,24 @@ class WHILLATS_API WhillatsTranscriber {
     std::string getLanguage() const;
     void setLanguage(const char* language);
     void setThreadCount(int n);
+    // The response callback receives final transcripts only; subscribe here to
+    // also receive interim hypotheses.
     void setCallback(WhillatsSetResponseCallback cb);
     void setLanguageCallback(WhillatsSetLanguageCallback cb);
+    void setTranscriptCallback(WhillatsSetTranscriptCallback cb);
 
   private:
     WhillatsSetResponseCallback _callback; 
     WhillatsSetLanguageCallback _language_callback;
+    WhillatsSetTranscriptCallback _transcript_callback;
+#ifndef WHILLATS_INPROCESS
     std::shared_ptr<WhillatsServerConnection> _conn;
     std::unique_ptr<WhillatsTranscriberClient> _whisperClient;
+#endif
+#ifdef WHILLATS_INPROCESS
+    std::string _model_path;
+    std::unique_ptr<WhisperTranscriber> _local;
+#endif
     std::string _language = "en";
     int _threadCount = 0;
 };
@@ -186,8 +221,15 @@ class WHILLATS_API WhillatsLlama {
 
   private:
     WhillatsSetResponseCallback _callback;
+#ifndef WHILLATS_INPROCESS
     std::shared_ptr<WhillatsServerConnection> _conn;
     std::unique_ptr<WhillatsLlamaClient> _llamaClient;
+#endif
+#ifdef WHILLATS_INPROCESS
+    std::string _model_path, _mmproj_path;
+    int _threadCount = 0;
+    std::shared_ptr<LlamaDeviceBase> _local;
+#endif
 };
 
 // Helper functions

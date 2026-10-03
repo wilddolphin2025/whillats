@@ -25,11 +25,16 @@
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
-#include "whillats_client.h"
-#include "whillats_ipc.h"
 #include "whillats_utils.h"
 
-// Thin client library: always uses whillats_server subprocess
+#ifdef WHILLATS_INPROCESS
+#include "whisper_transcription.h"
+#include "llama_device_base.h"
+#else
+#include "whillats_client.h"
+#include "whillats_ipc.h"
+
+// Thin client library: Whisper/Llama run in the whillats_server subprocess
 
 // Shared server connection (lazy-initialized, one per process)
 static std::shared_ptr<WhillatsServerConnection> s_serverConn;
@@ -113,6 +118,7 @@ static std::shared_ptr<WhillatsServerConnection> getOrCreateServer() {
     fprintf(stderr, "[whillats] Server started: %s\n", server_path.c_str());
     return s_serverConn;
 }
+#endif  // WHILLATS_INPROCESS
 
 // ================================================================
 // TTS — server-backed on Linux, platform-native on Apple
@@ -131,6 +137,8 @@ void WhillatsTTS::queueText(const char* t, const char* l) { _wrapper->synthesize
 void WhillatsTTS::enableSpeakerphone() { _wrapper->enableSpeakerphone(); }
 void WhillatsTTS::disableSpeakerphone() { _wrapper->disableSpeakerphone(); }
 void WhillatsTTS::setThreadCount(int) {}
+// The synthesizer wrapper holds &_callback, so updating it in place retargets audio.
+void WhillatsTTS::setCallback(WhillatsSetAudioCallback cb) { _callback = cb; }
 
 #elif defined(__APPLE__) && TARGET_OS_OSX
 #include "synthesis.h"
@@ -179,8 +187,106 @@ void WhillatsSetResponseCallback::OnResponseComplete(bool success, const char* r
     if (callback_) callback_(success, response, user_data_);
 }
 
+#ifdef WHILLATS_INPROCESS
 // ================================================================
-// Whisper Transcriber — server-backed on Linux
+// Whisper Transcriber — in-process (iOS)
+// ================================================================
+WhillatsTranscriber::WhillatsTranscriber(const char* model_path,
+    WhillatsSetResponseCallback callback,
+    WhillatsSetLanguageCallback language_callback)
+    : _callback(callback), _language_callback(language_callback),
+      _model_path(model_path ? model_path : ""), _language("auto") {}
+
+WhillatsTranscriber::WhillatsTranscriber(const char* model_path,
+    WhillatsSetResponseCallback callback)
+    : WhillatsTranscriber(model_path, callback, {nullptr, nullptr}) {}
+
+WhillatsTranscriber::~WhillatsTranscriber() { stop(); }
+
+bool WhillatsTranscriber::start() {
+    if (!_local) {
+        _local = std::make_unique<WhisperTranscriber>(_model_path.c_str(), _callback, _language_callback);
+        _local->setTranscriptCallback(_transcript_callback);
+        _local->setLanguage(_language);
+        if (_threadCount > 0) _local->setThreadCount(_threadCount);
+    }
+    return _local->start();
+}
+
+void WhillatsTranscriber::stop() { if (_local) _local->stop(); }
+void WhillatsTranscriber::setCallback(WhillatsSetResponseCallback cb) {
+    _callback = cb;
+    if (_local) _local->setResponseCallback(cb);
+}
+void WhillatsTranscriber::setLanguageCallback(WhillatsSetLanguageCallback cb) {
+    _language_callback = cb;
+    if (_local) _local->setLanguageCallback(cb);
+}
+void WhillatsTranscriber::setTranscriptCallback(WhillatsSetTranscriptCallback cb) {
+    _transcript_callback = cb;
+    if (_local) _local->setTranscriptCallback(cb);
+}
+void WhillatsTranscriber::processAudioBuffer(uint8_t* buf, const size_t size) {
+    if (_local) _local->processAudioBuffer(buf, size);
+}
+std::string WhillatsTranscriber::getLanguage() const { return _local ? _local->getLanguage() : _language; }
+void WhillatsTranscriber::setLanguage(const char* lang) {
+    if (!lang) return;
+    _language = lang;
+    if (_local) _local->setLanguage(_language);
+}
+void WhillatsTranscriber::setThreadCount(int n) {
+    _threadCount = n;
+    if (_local) _local->setThreadCount(n);
+}
+
+// ================================================================
+// Llama — in-process (iOS)
+// ================================================================
+// One model stays resident for the app's lifetime: the audio device recreates
+// WhillatsLlama for every call, and reloading GGUF weights costs seconds.
+static std::mutex s_llamaMutex;
+static std::shared_ptr<LlamaDeviceBase> s_llama;
+
+WhillatsLlama::WhillatsLlama(const char* model_path, WhillatsSetResponseCallback callback)
+    : WhillatsLlama(model_path, "", callback) {}
+
+WhillatsLlama::WhillatsLlama(const char* model_path, const char* mmproj_path, WhillatsSetResponseCallback callback)
+    : _callback(callback), _model_path(model_path ? model_path : ""), _mmproj_path(mmproj_path ? mmproj_path : "") {}
+
+WhillatsLlama::~WhillatsLlama() {
+    stop();
+    if (_local) _local->setCallback({nullptr, nullptr});
+}
+
+bool WhillatsLlama::start() {
+    if (!_local) {
+        std::lock_guard<std::mutex> lock(s_llamaMutex);
+        if (!s_llama || s_llama->modelPath() != _model_path || s_llama->mmprojPath() != _mmproj_path)
+            s_llama = std::make_shared<LlamaDeviceBase>(_model_path.c_str(), _mmproj_path.c_str(), _callback);
+        _local = s_llama;
+    }
+    _local->setCallback(_callback);
+    if (_threadCount > 0) _local->setThreadCount(_threadCount);
+    return _local->start();
+}
+
+bool WhillatsLlama::isRunning() const { return _local && _local->isRunning(); }
+void WhillatsLlama::setThreadCount(int n) { _threadCount = n; }
+void WhillatsLlama::stop() { if (_local) _local->stop(); }
+void WhillatsLlama::setCallback(WhillatsSetResponseCallback cb) {
+    _callback = cb;
+    if (_local) _local->setCallback(cb);
+}
+void WhillatsLlama::askLlama(const char* prompt) { if (_local) _local->askLlama(prompt); }
+void WhillatsLlama::askWithImageFile(const char*, const char*, int, int) {}
+void WhillatsLlama::askWithYUVRaw(const char*, const uint8_t*, const uint8_t*,
+    const uint8_t*, int, int, size_t, size_t) {}
+void WhillatsLlama::receiveVideoFrame(const YUVData& yuv) { if (_local) _local->receiveVideoFrame(yuv); }
+
+#else
+// ================================================================
+// Whisper Transcriber — server-backed (Linux, macOS)
 // ================================================================
 WhillatsTranscriber::WhillatsTranscriber(const char* model_path,
     WhillatsSetResponseCallback callback,
@@ -200,6 +306,7 @@ bool WhillatsTranscriber::start() {
     if (!_conn) return false;
     _conn->setWhisperCallback(_callback.callback_, _callback.user_data_);
     _conn->setLanguageCallback(_language_callback.callback_, _language_callback.user_data_);
+    _conn->setTranscriptCallback(_transcript_callback.callback_, _transcript_callback.user_data_);
     _whisperClient = std::make_unique<WhillatsTranscriberClient>(*_conn);
     return _whisperClient->start();
 }
@@ -213,6 +320,10 @@ void WhillatsTranscriber::setLanguageCallback(WhillatsSetLanguageCallback cb) {
     _language_callback = cb;
     if (_conn) _conn->setLanguageCallback(cb.callback_, cb.user_data_);
 }
+void WhillatsTranscriber::setTranscriptCallback(WhillatsSetTranscriptCallback cb) {
+    _transcript_callback = cb;
+    if (_conn) _conn->setTranscriptCallback(cb.callback_, cb.user_data_);
+}
 
 void WhillatsTranscriber::processAudioBuffer(uint8_t* buf, const size_t size) {
     if (_whisperClient) _whisperClient->processAudioBuffer(buf, size);
@@ -223,7 +334,7 @@ void WhillatsTranscriber::setLanguage(const char* lang) { if (lang) _language = 
 void WhillatsTranscriber::setThreadCount(int n) { _threadCount = n; }
 
 // ================================================================
-// Llama — server-backed on Linux
+// Llama — server-backed (Linux, macOS)
 // ================================================================
 WhillatsLlama::WhillatsLlama(const char* model_path, WhillatsSetResponseCallback callback)
     : _callback(callback) {
@@ -261,6 +372,8 @@ void WhillatsLlama::askWithYUVRaw(const char*, const uint8_t*, const uint8_t*,
 void WhillatsLlama::receiveVideoFrame(const YUVData& yuv) {
     if (_llamaClient) _llamaClient->receiveVideoFrame(yuv);
 }
+
+#endif  // WHILLATS_INPROCESS
 
 bool WHILLATS_API save_yuv_as_bmp(const YUVData& yuv, const char* path) {
     (void)yuv; (void)path;

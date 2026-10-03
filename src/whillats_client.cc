@@ -125,6 +125,16 @@ void WhillatsServerConnection::readerThread() {
                     _whisperFn(true, (const char*)payload, _whisperUd);
                 break;
 
+            case MSG_WHISPER_TRANSCRIPT:
+                if (_transcriptFn && payload && h.len >= 1) {
+                    char* text = strchr((char*)payload + 1, '\t');
+                    if (text) {
+                        *text++ = 0;
+                        _transcriptFn(text, payload[0] == 'F', (const char*)payload + 1, _transcriptUd);
+                    }
+                }
+                break;
+
             case MSG_WHISPER_LANGUAGE:
                 if (_langFn && payload)
                     _langFn(true, (const char*)payload, _langUd);

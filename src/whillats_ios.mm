@@ -273,4 +273,16 @@
 
 @end
 
+void whillats_post_transcript(const char* text, bool is_final, const char* language) {
+    NSString* t = [NSString stringWithUTF8String:text ? text : ""];
+    NSString* l = [NSString stringWithUTF8String:language ? language : ""];
+    if (!t) return;
+    NSDictionary* info = @{@"text": t, @"final": @(is_final), @"language": l ?: @""};
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"WhillatsTranscriptNotification"
+                                                            object:nil
+                                                          userInfo:info];
+    });
+}
+
 #endif // TARGET_OS_IOS

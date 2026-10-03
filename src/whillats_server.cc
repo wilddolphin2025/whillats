@@ -44,6 +44,11 @@ static void whisper_callback(bool success, const char* response, void*) {
         send_response(MSG_WHISPER_RESULT, response);
 }
 
+static void transcript_callback(const char* text, bool is_final, const char* language, void*) {
+    std::string msg = std::string(is_final ? "F" : "I") + (language ? language : "") + "\t" + (text ? text : "");
+    send_response(MSG_WHISPER_TRANSCRIPT, msg.c_str());
+}
+
 static void language_callback(bool success, const char* language, void*) {
     if (success && language)
         send_response(MSG_WHISPER_LANGUAGE, language);
@@ -142,6 +147,7 @@ int main(int argc, char* argv[]) {
             if (!whisper && cfg.whisper_model[0]) {
                 fprintf(stderr, "[whillats_server] Preloading Whisper...\n");
                 whisper = std::make_unique<WhisperTranscriber>(cfg.whisper_model, whisperCb, langCb);
+                whisper->setTranscriptCallback({transcript_callback, nullptr});
                 if (cfg.whisper_threads > 0) whisper->setThreadCount(cfg.whisper_threads);
                 if (cfg.language[0]) whisper->setLanguage(cfg.language);
                 std::thread([&whisper]() {
