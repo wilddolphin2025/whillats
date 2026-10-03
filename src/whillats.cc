@@ -260,6 +260,7 @@ WhillatsLlama::~WhillatsLlama() {
 }
 
 bool WhillatsLlama::start() {
+    const bool new_call = !_local;
     if (!_local) {
         std::lock_guard<std::mutex> lock(s_llamaMutex);
         if (!s_llama || s_llama->modelPath() != _model_path || s_llama->mmprojPath() != _mmproj_path)
@@ -268,7 +269,11 @@ bool WhillatsLlama::start() {
     }
     _local->setCallback(_callback);
     if (_threadCount > 0) _local->setThreadCount(_threadCount);
-    return _local->start();
+    if (!_local->start()) return false;
+    // The model outlives calls; each WhillatsLlama (one per call) starts a fresh
+    // conversation, while stop()/start() for barge-in keeps the history.
+    if (new_call) _local->resetConversation();
+    return true;
 }
 
 bool WhillatsLlama::isRunning() const { return _local && _local->isRunning(); }
