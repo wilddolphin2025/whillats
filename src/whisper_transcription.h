@@ -59,6 +59,8 @@ public:
     void setDetectLanguage(bool detectLanguage) { if (detectLanguage) setLanguage("auto"); }
     // Biases decoding toward expected vocabulary, e.g. "dial, hang up, mute".
     void setInitialPrompt(const std::string& prompt) { std::lock_guard<std::mutex> l(_cfgMutex); _initialPrompt = prompt; }
+    // Comma-separated ISO codes ("en,es,ru") that auto-detection may choose from.
+    void setAllowedLanguages(const std::string& codes);
 
     // Speech/noise ratio required to open the VAD (linear RMS ratio).
     void setVADThreshold(float threshold) { _vadSnr = std::max(1.5f, threshold * 4.0f); }
@@ -83,10 +85,13 @@ private:
     void emit(const std::string& text, bool final, const std::string& lang);
     static bool isValidText(std::string& text);
     static bool abortCallback(void* user_data);
+    void warmUp(whisper_state* state, int audioCtx);
+    std::string detectLanguage(const std::vector<float>& pcm, const std::vector<int>& allowed);
     static std::string collapseRepeats(const std::string& s);
 
     whisper_context* _ctx = nullptr;
     whisper_state* _state = nullptr;
+    whisper_state* _detState = nullptr;  // language detection only, created on first auto-detect
 
     WhillatsSetResponseCallback _responseCallback;
     WhillatsSetLanguageCallback _languageCallback;
@@ -95,7 +100,8 @@ private:
 
     std::mutex _cfgMutex;
     std::string _language = "auto";
-    std::string _initialPrompt;
+    std::string _initialPrompt;    // English-only bias (e.g. phone commands)
+    std::vector<int> _allowedLangs; // auto-detect candidates; empty = all
 
     // Capture side (audio thread) -> worker thread.
     AudioRingBuffer<float> _ring;
@@ -121,6 +127,7 @@ private:
     bool _newAudioSinceInterim = false;
     float _noise = 0.003f;
     std::string _uttLang;          // language locked for the current utterance
+    std::string _convLang;         // language of the last final (fallback for short commands)
     std::string _lastInterim;
     std::string _lastReportedLang;
 
@@ -138,6 +145,8 @@ private:
     static constexpr int kMinInterimMs = 800;
     static constexpr int kMaxUtteranceMs = 15000;
     static constexpr int kFastFinalMs = 4000;
+    static constexpr int kLangLockMs = 1500;    // shorter interims are too short to trust detection
+    static constexpr int kLangDetectMs = 3000;  // audio window used for language detection
     static constexpr int kTailKeepMs = 200;
     static constexpr float kAbsMinRms = 0.004f;
 };

@@ -12,6 +12,8 @@
 
 #include "whisper_transcription.h"
 
+#include <algorithm>
+
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -56,11 +58,13 @@ WhisperTranscriber::WhisperTranscriber(const char* modelPath,
     _preroll.assign(kPrerollMs * kSamplesPerMs, 0.0f);
     _utt.reserve(kMaxUtteranceMs * kSamplesPerMs);
     if (const char* prompt = getenv("WHISPER_INITIAL_PROMPT")) _initialPrompt = prompt;
+    if (const char* langs = getenv("WHISPER_LANGUAGES")) setAllowedLanguages(langs);
     if (!modelPath || !initModel(modelPath)) LOG_E("Failed to initialize Whisper");
 }
 
 WhisperTranscriber::~WhisperTranscriber() {
     stop();
+    if (_detState) whisper_free_state(_detState);
     if (_state) whisper_free_state(_state);
     if (_ctx) whisper_free(_ctx);
 }
@@ -68,7 +72,10 @@ WhisperTranscriber::~WhisperTranscriber() {
 bool WhisperTranscriber::initModel(const std::string& modelPath) {
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = true;
-    cparams.flash_attn = true;
+    // Flash attention pads the cross-attention cache to 256 frames and leaves
+    // stale encoder output in the padding when audio_ctx shrinks between
+    // calls, which garbles trimmed decodes ("Hang up." -> "Anio.").
+    cparams.flash_attn = false;
     _ctx = whisper_init_from_file_with_params(modelPath.c_str(), cparams);
     if (!_ctx) {
         LOG_E("Failed to load Whisper model from " << modelPath);
@@ -81,8 +88,58 @@ bool WhisperTranscriber::initModel(const std::string& modelPath) {
         _ctx = nullptr;
         return false;
     }
+    // Compiles GPU kernels before the first utterance.
+    warmUp(_state, 64);
     LOG_I("Whisper streaming STT ready: " << modelPath);
     return true;
+}
+
+void WhisperTranscriber::setAllowedLanguages(const std::string& codes) {
+    std::vector<int> ids;
+    size_t start = 0;
+    while (start <= codes.size()) {
+        size_t end = codes.find(',', start);
+        if (end == std::string::npos) end = codes.size();
+        std::string code = trim(codes.substr(start, end - start));
+        int id = code.empty() ? -1 : whisper_lang_id(code.c_str());
+        if (id >= 0) ids.push_back(id);
+        start = end + 1;
+    }
+    std::lock_guard<std::mutex> l(_cfgMutex);
+    _allowedLangs = std::move(ids);
+}
+
+// Language auto-detection encodes with whatever audio_ctx the state's last
+// decode used (0 = a full 30 s window); a tiny decode pins it.
+void WhisperTranscriber::warmUp(whisper_state* state, int audioCtx) {
+    std::vector<float> silence(kSampleRate / 2, 0.0f);
+    whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    p.print_progress = p.print_realtime = p.print_timestamps = p.print_special = false;
+    p.no_timestamps = p.single_segment = true;
+    p.language = "en";
+    p.audio_ctx = audioCtx;
+    p.max_tokens = 1;
+    whisper_full_with_state(_ctx, state, p, silence.data(), (int)silence.size());
+}
+
+// Whisper's built-in detection chooses among ~100 languages (short commands
+// come out as Korean) and inflates the no-speech probability of the decode
+// that follows, so detect here, restricted to the call's languages, and
+// always decode with an explicit language.
+std::string WhisperTranscriber::detectLanguage(const std::vector<float>& pcm, const std::vector<int>& allowed) {
+    const int threads = _nThreads > 0 ? _nThreads : (int)std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+    std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+    // A separate state: detecting on the decode state skews the no-speech
+    // probability of the next decode, so real speech gets dropped.
+    if (!_detState && (_detState = whisper_init_state(_ctx))) warmUp(_detState, kLangDetectMs / 20);
+    if (!_detState || whisper_pcm_to_mel_with_state(_ctx, _detState, pcm.data(), (int)pcm.size(), threads) != 0 ||
+        whisper_lang_auto_detect_with_state(_ctx, _detState, 0, threads, probs.data()) < 0) {
+        return !_convLang.empty() ? _convLang : allowed.empty() ? "en" : whisper_lang_str(allowed[0]);
+    }
+    int best = allowed.empty() ? 0 : allowed[0];
+    if (allowed.empty()) { for (int id = 0; id < (int)probs.size(); ++id) if (probs[id] > probs[best]) best = id; }
+    else { for (int id : allowed) if (probs[id] > probs[best]) best = id; }
+    return whisper_lang_str(best);
 }
 
 void WhisperTranscriber::setTranscriptCallback(WhillatsSetTranscriptCallback cb) {
@@ -126,6 +183,7 @@ bool WhisperTranscriber::start() {
     if (_worker.joinable()) _worker.join();
     _ring.clear();
     resetUtterance();
+    _convLang.clear();
     _running = true;
     _worker = std::thread(&WhisperTranscriber::run, this);
     return true;
@@ -258,11 +316,15 @@ bool WhisperTranscriber::abortCallback(void* user_data) {
 bool WhisperTranscriber::decode(const std::vector<float>& pcm, bool final, Decoded& out) {
     if (!_ctx || !_state || pcm.empty()) return false;
     std::string lang, prompt;
+    std::vector<int> allowed;
     {
         std::lock_guard<std::mutex> l(_cfgMutex);
-        lang = _uttLang.empty() ? _language : _uttLang;
+        lang = _language;
         prompt = _initialPrompt;
+        allowed = _allowedLangs;
     }
+    const bool autoLang = lang.empty() || lang == "auto";
+    if (autoLang) lang = _uttLang.empty() ? detectLanguage(pcm, allowed) : _uttLang;
 
     whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     p.n_threads = _nThreads > 0 ? _nThreads : (int)std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
@@ -276,8 +338,9 @@ bool WhisperTranscriber::decode(const std::vector<float>& pcm, bool final, Decod
     p.temperature = 0.0f;
     p.temperature_inc = final ? 0.2f : 0.0f;  // fallback re-decodes only for finals
     p.no_speech_thold = 0.6f;
-    p.language = (lang.empty() || lang == "auto") ? nullptr : lang.c_str();
-    p.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
+    // The prompt is English; it would drag other languages into English.
+    p.initial_prompt = (lang == "en" && !prompt.empty()) ? prompt.c_str() : nullptr;
+    p.language = lang.c_str();
     // Encoder cost scales with audio_ctx (50 frames/s, 1500 = 30 s). Trimming
     // it to the audio actually heard makes interims cheap and short finals
     // (voice commands) 5-8x faster; long finals keep the full window because
@@ -292,6 +355,10 @@ bool WhisperTranscriber::decode(const std::vector<float>& pcm, bool final, Decod
     p.abort_callback_user_data = this;
 
     if (whisper_full_with_state(_ctx, _state, p, pcm.data(), (int)pcm.size()) != 0) return false;
+    if (autoLang) {
+        if (!final && _uttLang.empty() && pcm.size() >= (size_t)kLangLockMs * kSamplesPerMs) _uttLang = lang;
+        if (final) _convLang = lang;
+    }
 
     std::string text;
     const int n = whisper_full_n_segments_from_state(_state);
@@ -299,9 +366,7 @@ bool WhisperTranscriber::decode(const std::vector<float>& pcm, bool final, Decod
         if (whisper_full_get_segment_no_speech_prob_from_state(_state, i) > p.no_speech_thold) continue;
         text += whisper_full_get_segment_text_from_state(_state, i);
     }
-    const char* detected = whisper_lang_str(whisper_full_lang_id_from_state(_state));
-    out.language = detected ? detected : lang;
-    if (_uttLang.empty() && detected) _uttLang = detected;
+    out.language = lang;
     out.text = trim(collapseRepeats(text));
     return true;
 }
