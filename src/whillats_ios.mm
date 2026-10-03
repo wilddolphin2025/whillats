@@ -129,11 +129,11 @@
         utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:language];
         utterance.rate = 0.5;
         
-        AVAudioPCMBuffer *silenceBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:_engineFormat
+        AVAudioPCMBuffer *silenceBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self->_engineFormat
                                                                        frameCapacity:48000];
         silenceBuffer.frameLength = 48000;
-        [_playerNode scheduleBuffer:silenceBuffer completionHandler:nil];
-        [_playerNode play];
+        [self->_playerNode scheduleBuffer:silenceBuffer completionHandler:nil];
+        [self->_playerNode play];
         
         [self.synthesizer speakUtterance:utterance];
     });

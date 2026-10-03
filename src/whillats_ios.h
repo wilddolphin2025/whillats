@@ -25,8 +25,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef void (*AudioCallback)(bool success, const uint16_t *buffer, size_t size, void *user_data);
-typedef void (*CompletionCallback)(void* user_data);
+typedef void (*AudioCallback)(bool success, const uint16_t *_Nullable buffer, size_t size, void *_Nullable user_data);
+typedef void (*CompletionCallback)(void *_Nullable user_data);
 
 #if TARGET_OS_IOS
 @interface WhillatsSpeechSynthesizerProcessor : NSObject <AVSpeechSynthesizerDelegate>
