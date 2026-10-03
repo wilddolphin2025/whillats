@@ -354,7 +354,14 @@ bool LlamaSimpleChat::isCompleteSentence(const std::string &text) {
     size_t end = text.find_last_not_of(" \n\r\t\"')");
     if (end == std::string::npos) return false;
     char last = text[end];
-    return last == '.' || last == '!' || last == '?' || last == '\n';
+    if (last == '.' || last == '!' || last == '?' || last == '\n') return true;
+    // UTF-8 terminators: CJK 。！？, Devanagari ।, Arabic ؟
+    const std::string head = text.substr(0, end + 1);
+    for (const char* t : {"\u3002", "\uFF01", "\uFF1F", "\u0964", "\u061F"}) {
+        const size_t n = strlen(t);
+        if (head.size() >= n && head.compare(head.size() - n, n, t) == 0) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
