@@ -111,13 +111,11 @@ static std::string clean_response(const std::string& response) {
     cleaned = std::regex_replace(cleaned, re_ctrl, "");
     // Strip markdown
     cleaned = strip_markdown(cleaned);
-    // Trim trailing whitespace
+    // Trim surrounding whitespace (streamed sentences start with the separator space)
+    auto first = cleaned.find_first_not_of(" \n\r\t");
+    if (first == std::string::npos) return {};
     auto last = cleaned.find_last_not_of(" \n\r\t");
-    if (last != std::string::npos)
-        cleaned = cleaned.substr(0, last + 1);
-    else
-        cleaned.clear();
-    return cleaned;
+    return cleaned.substr(first, last - first + 1);
 }
 
 
