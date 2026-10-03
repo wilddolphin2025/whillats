@@ -54,7 +54,11 @@ public:
     void setTranscriptCallback(WhillatsSetTranscriptCallback cb);
     void setResponseCallback(WhillatsSetResponseCallback cb);
     void setLanguageCallback(WhillatsSetLanguageCallback cb);
-    void setLanguage(const std::string& language) { std::lock_guard<std::mutex> l(_cfgMutex); _language = language; }
+    // Empty (no language configured) means auto-detect.
+    void setLanguage(const std::string& language) {
+        std::lock_guard<std::mutex> l(_cfgMutex);
+        _language = language.empty() ? "auto" : language;
+    }
     std::string getLanguage() { std::lock_guard<std::mutex> l(_cfgMutex); return _language; }
     void setDetectLanguage(bool detectLanguage) { if (detectLanguage) setLanguage("auto"); }
     // Biases decoding toward expected vocabulary, e.g. "dial, hang up, mute".
