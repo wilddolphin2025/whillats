@@ -11,39 +11,52 @@
  */
 
 #include "whisper_transcription.h"
-#include "whisper_helpers.h"
-#include "whillats_utils.h"
 
-#include <cstring>
-#include <algorithm>
-#include <map>
-#include <thread>
+#include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <regex>
 
-#include <whisper.h>
+#ifdef WHILLATS_INPROCESS
+// whillats_ios.mm: mirrors every transcript to NSNotificationCenter as
+// "WhillatsTranscriptNotification" {text, final, language} for the host app.
+void whillats_post_transcript(const char* text, bool is_final, const char* language);
+#endif
 
-WhisperTranscriber::WhisperTranscriber(const char* modelPath, 
+namespace {
+
+constexpr int kSamplesPerMs = WHISPER_SAMPLE_RATE / 1000;
+
+// Decodes one UTF-8 code point and advances p; returns 0 at end of string.
+uint32_t nextCodePoint(const unsigned char*& p) {
+    unsigned char c = *p;
+    if (!c) return 0;
+    int n = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+    uint32_t cp = n == 1 ? c : c & (0xFF >> (n + 1));
+    for (int i = 1; i < n && p[i]; i++) cp = (cp << 6) | (p[i] & 0x3F);
+    for (int i = 0; i < n && *p; i++) p++;
+    return cp;
+}
+
+std::string trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+}
+
+}  // namespace
+
+WhisperTranscriber::WhisperTranscriber(const char* modelPath,
     WhillatsSetResponseCallback callback,
     WhillatsSetLanguageCallback languageCallback)
-    : _audioBuffer(std::make_unique<AudioRingBuffer<float>>(WHISPER_SAMPLE_RATE * 60)),
-      _ctx(nullptr),
-      _state(nullptr),
-      _responseCallback(callback),
+    : _responseCallback(callback),
       _languageCallback(languageCallback),
-      _segmentComplete(false),
-      _nPast(0),
-      _maxContext(224),
-      _running(false) {
-    if (!InitializeWhisperModel(modelPath)) {
-        LOG_E("Failed to initialize Whisper");
-        return;
-    }
-
-    _pastTokens.push_back(whisper_token_sot(_ctx));
-    _pastTokens.push_back(whisper_token_transcribe(_ctx));
-    _nPast = 2;
-    LOG_I("Running v3");
+      _ring(kSampleRate * 30) {
+    _frame.reserve(kFrameSamples);
+    _preroll.assign(kPrerollMs * kSamplesPerMs, 0.0f);
+    _utt.reserve(kMaxUtteranceMs * kSamplesPerMs);
+    if (const char* prompt = getenv("WHISPER_INITIAL_PROMPT")) _initialPrompt = prompt;
+    if (!modelPath || !initModel(modelPath)) LOG_E("Failed to initialize Whisper");
 }
 
 WhisperTranscriber::~WhisperTranscriber() {
@@ -52,445 +65,306 @@ WhisperTranscriber::~WhisperTranscriber() {
     if (_ctx) whisper_free(_ctx);
 }
 
-bool WhisperTranscriber::InitializeWhisperModel(const std::string& modelPath) {
+bool WhisperTranscriber::initModel(const std::string& modelPath) {
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = true;
+    cparams.flash_attn = true;
     _ctx = whisper_init_from_file_with_params(modelPath.c_str(), cparams);
     if (!_ctx) {
-        LOG_E("Failed to load Whisper model from " << modelPath.c_str());
+        LOG_E("Failed to load Whisper model from " << modelPath);
         return false;
     }
-
-    { std::lock_guard<std::mutex> lock(_state_mutex);
-        _state = whisper_init_state(_ctx);
-        if (!_state) {
-            LOG_E("Failed to initialize Whisper state");
-            whisper_free(_ctx);
-            _ctx = nullptr;
-            return false;
-        }
+    _state = whisper_init_state(_ctx);
+    if (!_state) {
+        LOG_E("Failed to initialize Whisper state");
+        whisper_free(_ctx);
+        _ctx = nullptr;
+        return false;
     }
-
-    LOG_I("Whisper initialized successfully with model: " << modelPath.c_str());
+    LOG_I("Whisper streaming STT ready: " << modelPath);
     return true;
 }
 
-void WhisperTranscriber::processAudioBuffer(uint8_t* playoutBuffer, size_t kPlayoutBufferSizeInBytes) {
-    // Assuming kPlayoutBufferSizeInBytes is the size in BYTES
-    // and the data is 16-bit signed PCM, little-endian.
-    if(kPlayoutBufferSizeInBytes == 0) {
-        LOG_I("Shortcutting processing of audio buffer");
-        ProcessRemainingAudio();
+void WhisperTranscriber::setTranscriptCallback(WhillatsSetTranscriptCallback cb) {
+    std::lock_guard<std::mutex> l(_cbMutex);
+    _transcriptCallback = cb;
+}
+
+void WhisperTranscriber::setResponseCallback(WhillatsSetResponseCallback cb) {
+    std::lock_guard<std::mutex> l(_cbMutex);
+    _responseCallback = cb;
+}
+
+void WhisperTranscriber::setLanguageCallback(WhillatsSetLanguageCallback cb) {
+    std::lock_guard<std::mutex> l(_cbMutex);
+    _languageCallback = cb;
+}
+
+// Runs on the real-time audio thread: convert and enqueue only.
+void WhisperTranscriber::processAudioBuffer(uint8_t* buffer, size_t bytes) {
+    if (bytes == 0 || !buffer) {
+        _flushRequested = true;
+        _wake.notify_one();
         return;
     }
-    if (kPlayoutBufferSizeInBytes % 2 != 0) {
-        LOG_W("Playout buffer size is not even, expected 16-bit PCM data. Size: " << kPlayoutBufferSizeInBytes);
-        // Handle error appropriately, maybe return or log and continue carefully
-        return; 
-    }
-
-    size_t numSamples = kPlayoutBufferSizeInBytes / 2;
-    if (numSamples == 0) {
-        LOG_V("Received empty audio buffer.");
-        return;
-    }
-    
-    std::vector<float> samples(numSamples);
-    const int16_t* pcm16 = reinterpret_cast<const int16_t*>(playoutBuffer);
-
-    for (size_t i = 0; i < numSamples; ++i) {
-        // Convert int16_t sample to float [-1.0, 1.0]
-        samples[i] = static_cast<float>(pcm16[i]) / 32768.0f; 
-    }
-
-    // Ensure normalization is correct, clip if necessary (though ideally shouldn't be needed if input is proper 16-bit PCM)
-    for (size_t i = 0; i < numSamples; ++i) {
-        samples[i] = std::max(-1.0f, std::min(1.0f, samples[i]));
-    }
-
-    if (!_audioBuffer->write(samples.data(), samples.size())) {
-        LOG_W("Failed to write " << samples.size() << " samples to audio buffer");
-    } else {
-        // Log first few samples to verify conversion
-        std::ostringstream first_samples_ss;
-        size_t n_log = std::min((size_t)10, samples.size());
-         first_samples_ss << std::fixed << std::setprecision(3);
-        for(size_t i=0; i<n_log; ++i) {
-             first_samples_ss << samples[i] << (i == n_log-1 ? "" : ", ");
-        }
-
-        if (kDebug) {
-            LOG_V("Wrote " << samples.size() << " samples. First " << n_log << ": [" << first_samples_ss.str() << "]. Buffer available: " << _audioBuffer->availableToRead());
-        }
-    }
-}
-
-bool WhisperTranscriber::responseValidate(std::string& token_str) {
-    // Regex to remove content within [] or ()
-    std::regex bracket_regex(R"(\[[^\]]*\]|\([^)]*\))"); 
-    std::string token_str_cleaned = std::regex_replace(token_str, bracket_regex, "");
-    std::string token_spaces_check = token_str_cleaned;
-    // Remove ALL whitespace (including between words)
-    token_spaces_check.erase(std::remove_if(token_spaces_check.begin(), token_spaces_check.end(), ::isspace), token_spaces_check.end());
-    if(token_spaces_check.empty()) {
-        return false;
-    }
-
-    // Filter out garbage/noise tokens.
-    // Require at least 2 "word" characters: ASCII letters/digits OR the start of
-    // a multi-byte UTF-8 letter sequence in a known script range.
-    // Pure IPA modifier letters (ʕ ʔ ˈ etc., U+02B0-U+02FF) and similar
-    // non-alphabetic Unicode blocks are excluded by checking that lead bytes
-    // fall in common script ranges (Cyrillic E0-EF, CJK F0+, Latin-ext C3-CF, etc.)
-    // rather than U+02xx (C0 A0-BF / CA xx).
-    int real_chars = 0;
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(token_spaces_check.c_str());
-    while (*p) {
-        unsigned char c = *p;
-        if (std::isalnum(c)) {
-            // ASCII letter or digit
-            real_chars++;
-            p++;
-        } else if (c >= 0xC0) {
-            // Start of multi-byte UTF-8 sequence — decode code point to check range
-            uint32_t cp = 0;
-            int bytes = 0;
-            if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; bytes = 2; }
-            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; bytes = 3; }
-            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; bytes = 4; }
-            for (int i = 1; i < bytes && p[i]; i++)
-                cp = (cp << 6) | (p[i] & 0x3F);
-            // Accept common letter scripts; reject IPA/spacing modifiers (U+0250-U+02FF)
-            // and other non-word symbol blocks
-            if (!( (cp >= 0x0250 && cp <= 0x02FF) ||  // IPA / spacing modifiers
-                   (cp >= 0x2000 && cp <= 0x206F) ||  // general punctuation
-                   (cp >= 0x2200 && cp <= 0x22FF) ))   // math operators
-                real_chars++;
-            p += bytes;
-        } else {
-            p++;
-        }
-    }
-    if (real_chars < 2) {
-        return false;
-    }
-
-    // Reject noise hallucinations: any single non-ASCII codepoint repeated 3+
-    // times (e.g. "ღღღღღ", "ˈˈˈˈ") is always noise, never real speech.
-    {
-        std::map<uint32_t, int> cp_count;
-        const unsigned char* q = reinterpret_cast<const unsigned char*>(token_spaces_check.c_str());
-        while (*q) {
-            unsigned char c = *q;
-            if (c < 0x80) { q++; continue; }  // ASCII — skip
-            uint32_t cp = 0; int bytes = 1;
-            if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; bytes = 2; }
-            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; bytes = 3; }
-            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; bytes = 4; }
-            for (int i = 1; i < bytes && q[i]; i++) cp = (cp << 6) | (q[i] & 0x3F);
-            if (++cp_count[cp] >= 3) return false;
-            q += bytes;
-        }
-    }
-
-    token_str = token_str_cleaned;
-    return true;
-}
-
-bool WhisperTranscriber::TranscribeAudioNonBlocking(const std::vector<float>& samples) {
-    float duration_ms = (samples.size() / static_cast<float>(WHISPER_SAMPLE_RATE)) * 1000.0f;
-    LOG_V("Processing audio chunk of " << samples.size() << " samples (" << duration_ms << " ms)");
-
-    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    wparams.n_threads = (_nThreads > 0) ? _nThreads : std::max(1u, std::thread::hardware_concurrency());
-    wparams.temperature = 0.0f;
-    wparams.no_speech_thold = 0.95f;
-    wparams.logprob_thold = -1.0f;
-    wparams.language = (_language == "auto") ? nullptr : _language.c_str();
-    wparams.translate = false;
-    wparams.print_progress = false;
-    wparams.print_realtime = false;
-    wparams.single_segment = false;
-
-    {
-        std::lock_guard<std::mutex> lock(_state_mutex);
-        if (whisper_full_with_state(_ctx, _state, wparams, samples.data(), samples.size()) != 0) {
-            LOG_E("Whisper full processing failed");
-            return false;
-        }
-    }
-
-    int n_segments = whisper_full_n_segments_from_state(_state);
-    LOG_V("Number of segments: " << n_segments);
-
-    if (n_segments < 0) {
-        LOG_E("Invalid segment count: " << n_segments);
-        return false;
-    }
-
-    std::vector<whisper_token> new_tokens;
-    int vocab_size = whisper_n_vocab(_ctx);
-    for (int i_segment = 0; i_segment < n_segments; ++i_segment) {
-        int n_tokens = whisper_full_n_tokens_from_state(_state, i_segment);
-        LOG_V("Segment " << i_segment << " has " << n_tokens << " tokens");
-
-        if (n_tokens < 0) {
-            LOG_E("Invalid token count in segment " << i_segment << ": " << n_tokens);
-            continue;
-        }
-
-        for (int i = 0; i < n_tokens; ++i) {
-            whisper_token token = whisper_full_get_token_id_from_state(_state, i_segment, i);
-            if (token >= 0 && token < vocab_size) {
-                new_tokens.push_back(token);
-                const char* token_str = whisper_token_to_str(_ctx, token);
-                if (token_str) {
-                    LOG_V("Segment " << i_segment << ", Token " << i << ": " << token << " (" << token_str << ")");
-                } else {
-                    LOG_W("Null token string for valid token " << token);
-                }
-            } else {
-                LOG_W("Invalid token ID " << token << " (vocab size: " << vocab_size << ")");
-            }
-        }
-    }
-
-    // Detect language BEFORE sending text so the language tag is correct when
-    // the client receives the transcription result.
-    int lang_id = whisper_full_lang_id_from_state(_state);
-    const char* detected_lang = whisper_lang_str(lang_id);
-    LOG_I("Auto-detected language by whisper_full_with_state: " << detected_lang);
-    if (_language == "auto") {
-        // In auto mode: always report detected language; never lock _language so
-        // every chunk gets fresh detection.
-        _languageCallback.OnLanguageDetected(true, detected_lang);
-    } else if (_language != detected_lang) {
-        LOG_I("Detected language mismatch, updating from " << _language << " to " << detected_lang);
-        _language = detected_lang;
-        _languageCallback.OnLanguageDetected(true, detected_lang);
-    }
-
-    if (!new_tokens.empty()) {
-        LOG_V("Total decoded tokens: " << new_tokens.size());
-        ProcessTokens(new_tokens);
-    } else {
-        LOG_V("No tokens decoded");
-    }
-
-    return true;
-}
-
-void WhisperTranscriber::ProcessTokens(const std::vector<whisper_token>& tokens) {
-    std::string chunk_text;
-    chunk_text.reserve(tokens.size() * 8);  // Pre-allocate
-
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        const char* token_str = whisper_token_to_str(_ctx, tokens[i]);
-        if (token_str) {
-            chunk_text += token_str;
-        } else {
-            LOG_W("Null token string for token " << tokens[i] << " at index " << i);
-        }
-    }
-
-    if (!chunk_text.empty() && responseValidate(chunk_text)) {
-        LOG_I("Chunk transcribed text: " << chunk_text.c_str());
-
-        // If this is a new segment, reset _fullTranscription
-        if (_segmentComplete) {
-            _fullTranscription.clear();
-            _segmentComplete = false;
-        }
-
-        // Append to full transcription
-        if (!_fullTranscription.empty()) {
-            _fullTranscription += " ";
-        }
-        _fullTranscription += chunk_text;
-
-        // Send only this chunk's text via callback
-         _responseCallback.OnResponseComplete(true, chunk_text.c_str());
-
-        // If chunk ends with silence or punctuation, mark segment complete
-        if (chunk_text.back() == '.' || chunk_text.back() == '?' || chunk_text.back() == '!') {
-            LOG_V("Segment complete. Full text: " << _fullTranscription.c_str());
-            _segmentComplete = true;
-        }
-    } else if (!_fullTranscription.empty()) {
-        // Silence after text indicates segment end
-        _fullTranscription.clear();
-        LOG_V("Segment complete due to silence. Full text: " << _fullTranscription.c_str());
-        _segmentComplete = true;
-    } else {
-        LOG_V("No text transcribed from tokens in chunk");
-    }
+    if (bytes % 2) return;
+    const size_t n = bytes / 2;
+    if (_scratch.size() < n) _scratch.resize(n);
+    const int16_t* pcm = reinterpret_cast<const int16_t*>(buffer);
+    for (size_t i = 0; i < n; ++i) _scratch[i] = pcm[i] * (1.0f / 32768.0f);
+    _ring.write(_scratch.data(), n);
+    _wake.notify_one();
 }
 
 bool WhisperTranscriber::start() {
-    if (_ctx == nullptr) {
+    if (!_ctx) {
         LOG_E("Whisper context is not initialized");
         return false;
     }
-
     std::lock_guard<std::mutex> lock(_threadMutex);
-
-    if (_running) {
-        return true; // already running
-    }
-
-    // Ensure any previous thread is cleaned up
-    if (_processingThread.joinable()) {
-        if (std::this_thread::get_id() == _processingThread.get_id()) {
-            LOG_V("start() called from inside previous processing thread – detaching");
-            _processingThread.detach();
-        } else {
-            _processingThread.join();
-        }
-        _processingThread = std::thread();
-    }
-
+    if (_running) return true;
+    if (_worker.joinable()) _worker.join();
+    _ring.clear();
+    resetUtterance();
     _running = true;
-    _processingThread = std::thread([this] {
-        while (_running && RunProcessingThread()) {
-        }
-    });
-
-    return _running;
+    _worker = std::thread(&WhisperTranscriber::run, this);
+    return true;
 }
 
 void WhisperTranscriber::stop() {
     std::lock_guard<std::mutex> lock(_threadMutex);
+    if (!_running) return;
+    _running = false;
+    _wake.notify_all();
+    if (_worker.joinable()) {
+        if (std::this_thread::get_id() == _worker.get_id()) _worker.detach();
+        else _worker.join();
+    }
+}
 
-    if (!_running) {
+void WhisperTranscriber::run() {
+    std::vector<float> chunk;
+    while (_running) {
+        {
+            std::unique_lock<std::mutex> l(_wakeMutex);
+            _wake.wait_for(l, std::chrono::milliseconds(50), [this] {
+                return !_running || _flushRequested || _ring.availableToRead() >= (size_t)kFrameSamples;
+            });
+        }
+        if (!_running) break;
+
+        const size_t n = _ring.availableToRead();
+        if (n) {
+            chunk.resize(n);
+            _ring.read(chunk.data(), n);
+            for (size_t i = 0; i < n;) {
+                const size_t take = std::min(kFrameSamples - _frame.size(), n - i);
+                _frame.insert(_frame.end(), chunk.begin() + i, chunk.begin() + i + take);
+                i += take;
+                if (_frame.size() == (size_t)kFrameSamples) {
+                    consumeFrame(_frame.data());
+                    _frame.clear();
+                }
+            }
+        }
+        if (_flushRequested.exchange(false)) finalizeUtterance();
+        // Interims run after the backlog is consumed so endpointing never waits on them.
+        maybeEmitInterim();
+    }
+    resetUtterance();
+}
+
+// Adaptive energy VAD: the noise floor follows quiet frames quickly and loud
+// frames slowly; speech opens after kOnsetMs of voiced frames.
+void WhisperTranscriber::consumeFrame(const float* f) {
+    float e = 0.0f;
+    for (int i = 0; i < kFrameSamples; ++i) e += f[i] * f[i];
+    const float rms = std::sqrt(e / kFrameSamples);
+    const bool voiced = rms > std::max(kAbsMinRms, _noise * _vadSnr);
+
+    if (!_inSpeech) {
+        _noise = rms < _noise ? 0.9f * _noise + 0.1f * rms : 0.995f * _noise + 0.005f * rms;
+        _noise = std::max(_noise, 1e-4f);
+        std::memcpy(&_preroll[_prerollPos], f, kFrameSamples * sizeof(float));
+        _prerollPos = (_prerollPos + kFrameSamples) % _preroll.size();
+        _onsetRun = voiced ? _onsetRun + kFrameMs : 0;
+        if (_onsetRun < kOnsetMs) return;
+
+        _inSpeech = true;
+        _utt.assign(_preroll.begin() + _prerollPos, _preroll.end());
+        _utt.insert(_utt.end(), _preroll.begin(), _preroll.begin() + _prerollPos);
+        _speechMs = _onsetRun;
+        _silenceMs = 0;
+        _msSinceInterim = 0;
+        _newAudioSinceInterim = true;
         return;
     }
 
-    _running = false;
-
-    if (_processingThread.joinable()) {
-        if (std::this_thread::get_id() == _processingThread.get_id()) {
-            LOG_V("stop() called from processing thread – detaching instead of joining");
-            _processingThread.detach();
-        } else {
-            _processingThread.join();
-        }
+    if (rms < _noise) _noise = std::max(0.9f * _noise + 0.1f * rms, 1e-4f);
+    _utt.insert(_utt.end(), f, f + kFrameSamples);
+    _newAudioSinceInterim = true;
+    _msSinceInterim += kFrameMs;
+    if (voiced) {
+        _speechMs += kFrameMs;
+        _silenceMs = 0;
+    } else {
+        _silenceMs += kFrameMs;
     }
-
-    // Reset thread handle for safe restart later
-    _processingThread = std::thread();
-
-    ProcessRemainingAudio();
+    if (_silenceMs >= _endpointSilenceMs || _utt.size() >= (size_t)kMaxUtteranceMs * kSamplesPerMs)
+        finalizeUtterance();
 }
 
-bool WhisperTranscriber::RunProcessingThread() {
-    while (_running) {
-        size_t available = _audioBuffer->availableToRead();
-        if (available >= kMinPhraseSamples) {
-            // Read up to kMaxPhraseSamples to give language detection more context
-            size_t toRead = std::min(available, kMaxPhraseSamples);
-            std::vector<float> chunk(toRead);
-            _audioBuffer->read(chunk.data(), toRead);
-            if (kDebug) {LOG_V("Read chunk size: " << toRead << " samples. Buffer remaining: " << _audioBuffer->availableToRead());}
-            if (vad_simple(chunk, WHISPER_SAMPLE_RATE, 600, kVADThreshold, 50.0f, true)) {
-                TranscribeAudioNonBlocking(chunk);
-            }
-        } else {
-            if (kDebug) {LOG_V("Not enough samples: " << available << " < " << kMinPhraseSamples);}
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+void WhisperTranscriber::maybeEmitInterim() {
+    if (!_inSpeech || !_newAudioSinceInterim || _msSinceInterim < _interimIntervalMs ||
+        _speechMs < kMinInterimMs || _silenceMs >= kFrameMs * 10)
+        return;
+    _msSinceInterim = 0;
+    _newAudioSinceInterim = false;
+    Decoded d;
+    if (decode(_utt, false, d) && isValidText(d.text) && d.text != _lastInterim) {
+        _lastInterim = d.text;
+        emit(d.text, false, d.language);
     }
+}
+
+void WhisperTranscriber::finalizeUtterance() {
+    if (_inSpeech && _speechMs >= kMinSpeechMs) {
+        const size_t tail = (size_t)std::max(0, _silenceMs - kTailKeepMs) * kSamplesPerMs;
+        _utt.resize(_utt.size() - std::min(tail, _utt.size()));
+        Decoded d;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = decode(_utt, true, d) && isValidText(d.text);
+        LOG_V("Final decode " << _utt.size() / kSamplesPerMs << " ms audio in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() << " ms");
+        // An empty final still closes the utterance so UIs can clear interim text.
+        if (ok || !_lastInterim.empty()) emit(ok ? d.text : std::string(), true, d.language);
+    }
+    resetUtterance();
+}
+
+void WhisperTranscriber::resetUtterance() {
+    _inSpeech = false;
+    _utt.clear();
+    _onsetRun = _silenceMs = _speechMs = _msSinceInterim = 0;
+    _newAudioSinceInterim = false;
+    _uttLang.clear();
+    _lastInterim.clear();
+}
+
+bool WhisperTranscriber::abortCallback(void* user_data) {
+    return !static_cast<WhisperTranscriber*>(user_data)->_running.load(std::memory_order_relaxed);
+}
+
+bool WhisperTranscriber::decode(const std::vector<float>& pcm, bool final, Decoded& out) {
+    if (!_ctx || !_state || pcm.empty()) return false;
+    std::string lang, prompt;
+    {
+        std::lock_guard<std::mutex> l(_cfgMutex);
+        lang = _uttLang.empty() ? _language : _uttLang;
+        prompt = _initialPrompt;
+    }
+
+    whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    p.n_threads = _nThreads > 0 ? _nThreads : (int)std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+    p.print_progress = p.print_realtime = p.print_timestamps = p.print_special = false;
+    p.translate = false;
+    p.no_context = true;
+    p.no_timestamps = true;
+    p.single_segment = true;
+    p.suppress_blank = true;
+    p.suppress_nst = true;
+    p.temperature = 0.0f;
+    p.temperature_inc = final ? 0.2f : 0.0f;  // fallback re-decodes only for finals
+    p.no_speech_thold = 0.6f;
+    p.language = (lang.empty() || lang == "auto") ? nullptr : lang.c_str();
+    p.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
+    // Encoder cost scales with audio_ctx (50 frames/s, 1500 = 30 s). Trimming
+    // it to the audio actually heard makes interims cheap and short finals
+    // (voice commands) 5-8x faster; long finals keep the full window because
+    // a trimmed window can drop whole clauses there.
+    const int frames = (int)(pcm.size() / (kSamplesPerMs * 20));
+    if (!final) p.audio_ctx = std::min(whisper_n_audio_ctx(_ctx), frames + 64);
+    else if (frames <= kFastFinalMs / 20) p.audio_ctx = std::min(whisper_n_audio_ctx(_ctx), frames + 256);
+    // A shortened audio_ctx occasionally sends Whisper into a loop; capping
+    // tokens by duration (~8/s covers fast Cyrillic speech) bounds the cost.
+    p.max_tokens = (int)(pcm.size() / (kSamplesPerMs * 125)) + 12;
+    p.abort_callback = abortCallback;
+    p.abort_callback_user_data = this;
+
+    if (whisper_full_with_state(_ctx, _state, p, pcm.data(), (int)pcm.size()) != 0) return false;
+
+    std::string text;
+    const int n = whisper_full_n_segments_from_state(_state);
+    for (int i = 0; i < n; ++i) {
+        if (whisper_full_get_segment_no_speech_prob_from_state(_state, i) > p.no_speech_thold) continue;
+        text += whisper_full_get_segment_text_from_state(_state, i);
+    }
+    const char* detected = whisper_lang_str(whisper_full_lang_id_from_state(_state));
+    out.language = detected ? detected : lang;
+    if (_uttLang.empty() && detected) _uttLang = detected;
+    out.text = trim(collapseRepeats(text));
     return true;
 }
 
-void WhisperTranscriber::ProcessRemainingAudio() {
-    LOG_I("Processing remaining audio in _audioBuffer");
-    std::vector<float> chunk(kMinPhraseSamples);
-
-    while (_audioBuffer->availableToRead() >= kMinPhraseSamples) {
-        _audioBuffer->read(chunk.data(), kMinPhraseSamples);
-        LOG_V("Processing remaining chunk size: " << kMinPhraseSamples << " samples. Buffer remaining: " << _audioBuffer->availableToRead());
-        if (vad_simple(chunk, WHISPER_SAMPLE_RATE, 2000, 0.75f, 50.0f, true)) {
-            TranscribeAudioNonBlocking(chunk);
-        }
-    }
-
-    size_t remaining_samples = _audioBuffer->availableToRead();
-    if (remaining_samples > 0) {
-        LOG_V("Discarding " << remaining_samples << " leftover samples (less than " << kMinPhraseSamples << ")");
-        std::vector<float> leftover(remaining_samples);
-        _audioBuffer->read(leftover.data(), remaining_samples);
-    }
-
-    // Finalize current segment if any
-    if (!_fullTranscription.empty() && !_segmentComplete) {
-        LOG_I("Final segment text: " << _fullTranscription.c_str());
-        _responseCallback.OnResponseComplete(true, _fullTranscription.c_str());
-        _segmentComplete = true;
-    }
-
-    _fullTranscription.clear();  // Reset for next audio
-    LOG_V("Finished processing remaining audio");
+// Cuts a phrase repeated three or more times back to one ("a b. a b. a b." -> "a b.").
+std::string WhisperTranscriber::collapseRepeats(const std::string& s) {
+    const size_t n = s.size();
+    for (size_t len = 4; len * 3 <= n; ++len)
+        for (size_t i = 0; i + len * 3 <= n; ++i)
+            if (s.compare(i, len, s, i + len, len) == 0 && s.compare(i, len, s, i + 2 * len, len) == 0)
+                return s.substr(0, i + len);
+    return s;
 }
 
-void WhisperTranscriber::fft_forward(std::vector<std::complex<float>>& data, int n) {
-    int shift = 1;
-    for (int i = 0; i < n; i++) {
-        if (i < shift) {
-            std::swap(data[i], data[shift]);
-        }
-        int bit = n >> 1;
-        while (shift & bit) {
-            shift >>= 1;
-            bit >>= 1;
-        }
-        shift |= bit;
+void WhisperTranscriber::emit(const std::string& text, bool final, const std::string& lang) {
+    LOG_I((final ? "Final" : "Interim") << " [" << lang << "]: " << text);
+    std::lock_guard<std::mutex> l(_cbMutex);
+    if (final && !text.empty()) {
+        std::string configured = getLanguage();
+        if (configured == "auto" || lang != _lastReportedLang) _languageCallback.OnLanguageDetected(true, lang);
+        _lastReportedLang = lang;
     }
-
-    for (int step = 2; step <= n; step <<= 1) {
-        const int half = step >> 1;
-        const float theta = -2.0f * M_PI / step;
-        for (int i = 0; i < n; i += step) {
-            for (int j = 0; j < half; j++) {
-                const std::complex<float> twiddle = std::polar(1.0f, theta * j);
-                const std::complex<float> a = data[i + j];
-                const std::complex<float> b = data[i + j + half] * twiddle;
-                data[i + j] = a + b;
-                data[i + j + half] = a - b;
-            }
-        }
-    }
+    _transcriptCallback.OnTranscript(text.c_str(), final, lang.c_str());
+#ifdef WHILLATS_INPROCESS
+    whillats_post_transcript(text.c_str(), final, lang.c_str());
+#endif
+    if (final && !text.empty()) _responseCallback.OnResponseComplete(true, text.c_str());
 }
 
-bool WhisperTranscriber::vad_simple(const std::vector<float>& pcmf32, int sample_rate,
-                                    int last_ms, float vad_thold, float freq_thold, bool verbose) {
-    const int n_samples = pcmf32.size();
-    const int n_samples_window = last_ms * sample_rate / 1000;  // 16000 for 1000ms
+bool WhisperTranscriber::isValidText(std::string& text) {
+    static const std::regex kBracketed(R"(\[[^\]]*\]|\([^)]*\)|\*[^*]*\*)");
+    static const char* kHallucinations[] = {
+        "thanks for watching", "thank you for watching", "please subscribe",
+        "subtitles by", "amara.org", "transcribed by",
+    };
 
-    if (n_samples < n_samples_window) {
-        LOG_V("VAD: Too few samples (" << n_samples << " < " << n_samples_window << ")");
-        return false;
+    std::string cleaned = trim(std::regex_replace(text, kBracketed, ""));
+    if (cleaned.empty()) return false;
+
+    std::string lower(cleaned);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    for (const char* h : kHallucinations)
+        if (lower.find(h) != std::string::npos) return false;
+
+    // Need >= 2 letters/digits; IPA modifiers, punctuation and math symbols
+    // are Whisper noise. A run of 3+ identical non-ASCII code points ("ღღღ")
+    // is a noise hallucination too.
+    int letters = 0, run = 0;
+    uint32_t prev = 0;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(cleaned.c_str());
+    while (uint32_t cp = nextCodePoint(p)) {
+        run = cp == prev ? run + 1 : 1;
+        prev = cp;
+        if (cp < 0x80) {
+            letters += std::isalnum((int)cp) ? 1 : 0;
+            continue;
+        }
+        if (run >= 3) return false;
+        const bool symbol = (cp >= 0x0250 && cp <= 0x02FF) || (cp >= 0x2000 && cp <= 0x206F) ||
+                            (cp >= 0x2200 && cp <= 0x22FF);
+        letters += symbol ? 0 : 1;
     }
-
-    float energy = 0.0f;
-    float max_energy = 0.0f;
-    float noise_floor = noise_profile.noise_level;
-
-    for (int i = n_samples - n_samples_window; i < n_samples; i++) {
-        float sample = fabsf(pcmf32[i]);
-        energy += sample * sample;
-        max_energy = std::max(max_energy, sample);
-    }
-
-    energy = sqrtf(energy / n_samples_window);
-    noise_floor = std::max(noise_floor, 0.001f);
-    float snr = 20 * log10f(std::max(energy, 1e-10f) / noise_floor);
-
-    bool voice_detected = snr > 2.0f && max_energy > 0.002f;
-
-    if (verbose && voice_detected) {
-        LOG_V("VAD: energy=" << energy << ", SNR=" << snr << ", max=" << max_energy
-              << ", noise_floor=" << noise_floor << ", detected=" << (voice_detected ? "yes" : "no"));
-    }
-
-    return voice_detected;
+    if (letters < 2) return false;
+    text = cleaned;
+    return true;
 }
