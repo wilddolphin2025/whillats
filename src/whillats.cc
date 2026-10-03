@@ -283,7 +283,7 @@ void WhillatsLlama::setCallback(WhillatsSetResponseCallback cb) {
     _callback = cb;
     if (_local) _local->setCallback(cb);
 }
-void WhillatsLlama::askLlama(const char* prompt) { if (_local) _local->askLlama(prompt); }
+void WhillatsLlama::askLlama(const char* prompt, const char* lang) { if (_local) _local->askLlama(prompt, lang); }
 void WhillatsLlama::askWithImageFile(const char*, const char*, int, int) {}
 void WhillatsLlama::askWithYUVRaw(const char*, const uint8_t*, const uint8_t*,
     const uint8_t*, int, int, size_t, size_t) {}
@@ -369,7 +369,7 @@ void WhillatsLlama::setCallback(WhillatsSetResponseCallback cb) {
     _callback = cb;
     if (_conn) _conn->setLlamaCallback(cb.callback_, cb.user_data_);
 }
-void WhillatsLlama::askLlama(const char* prompt) { if (_llamaClient) _llamaClient->askLlama(prompt); }
+void WhillatsLlama::askLlama(const char* prompt, const char* lang) { if (_llamaClient) _llamaClient->askLlama(prompt, lang); }
 void WhillatsLlama::askWithImageFile(const char*, const char*, int, int) {}
 void WhillatsLlama::askWithYUVRaw(const char*, const uint8_t*, const uint8_t*,
     const uint8_t*, int, int, size_t, size_t) {}

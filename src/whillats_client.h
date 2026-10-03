@@ -86,7 +86,7 @@ public:
     void stop();
     bool isRunning() const { return _started; }
     void setThreadCount(int) {}
-    void askLlama(const char* prompt);
+    void askLlama(const char* prompt, const char* lang = nullptr);
     void receiveVideoFrame(const YUVData& yuv);
 
 private:

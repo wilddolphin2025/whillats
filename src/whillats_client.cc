@@ -221,9 +221,12 @@ void WhillatsLlamaClient::stop() {
     }
 }
 
-void WhillatsLlamaClient::askLlama(const char* prompt) {
-    if (_started && prompt)
-        _conn.sendMsg(MSG_LLAMA_ASK, prompt, (uint32_t)strlen(prompt));
+// Payload: prompt, optionally followed by '\0' and the language code.
+void WhillatsLlamaClient::askLlama(const char* prompt, const char* lang) {
+    if (!_started || !prompt) return;
+    std::string payload(prompt);
+    if (lang && *lang) { payload += '\0'; payload += lang; }
+    _conn.sendMsg(MSG_LLAMA_ASK, payload.data(), (uint32_t)payload.size());
 }
 
 void WhillatsLlamaClient::receiveVideoFrame(const YUVData& yuv) {

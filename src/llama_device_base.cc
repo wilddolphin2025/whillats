@@ -164,17 +164,58 @@ std::vector<uint8_t> YuvToRgb(const YUVData& yuv, int max_side, int& w, int& h) 
     return rgb;
 }
 
-bool IsMostlyNonLatin(const std::string& s) {
-    int latin = 0, other = 0;
+// Name of the dominant non-Latin script, or nullptr when the text is mostly
+// Latin. Naming the script makes Gemma switch language after earlier turns
+// in another language; a generic "reply in this language" does not.
+const char* NonLatinScript(const std::string& s) {
+    struct Range { char32_t lo, hi; const char* name; };
+    static const Range kScripts[] = {
+        {0x0370, 0x03FF, "Greek"},      {0x0400, 0x052F, "Cyrillic"},  {0x0590, 0x05FF, "Hebrew"},
+        {0x0600, 0x06FF, "Arabic"},     {0x0900, 0x097F, "Devanagari"}, {0x0E00, 0x0E7F, "Thai"},
+        {0x3040, 0x30FF, "Japanese"},   {0x4E00, 0x9FFF, "Chinese"},   {0xAC00, 0xD7AF, "Korean"},
+    };
+    int counts[sizeof(kScripts) / sizeof(kScripts[0])] = {};
+    int latin = 0;
     for (size_t i = 0; i < s.size();) {
         const unsigned char c = s[i];
-        if (c < 0x80) { latin += std::isalpha(c) ? 1 : 0; ++i; continue; }
-        const int len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
-        // U+0080..U+036F (2-byte lead < 0xCD) are Latin accents, not another script.
-        if (c >= 0xCD) ++other; else ++latin;
+        const int len = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+        char32_t cp = len == 1 ? c : (c & (0xFF >> (len + 1)));
+        for (int k = 1; k < len && i + k < s.size(); ++k) cp = (cp << 6) | (s[i + k] & 0x3F);
         i += len;
+        if (cp < 0x370) { latin += (cp >= 0x80 || std::isalpha((int)cp)) ? 1 : 0; continue; }
+        for (size_t r = 0; r < sizeof(kScripts) / sizeof(kScripts[0]); ++r)
+            if (cp >= kScripts[r].lo && cp <= kScripts[r].hi) { ++counts[r]; break; }
     }
-    return other > latin;
+    int best = 0;
+    for (size_t r = 1; r < sizeof(counts) / sizeof(counts[0]); ++r) if (counts[r] > counts[best]) best = (int)r;
+    // Kana mixed with kanji is Japanese, not Chinese.
+    if (kScripts[best].name == std::string("Chinese") && counts[6] > 0) best = 6;
+    return counts[best] > latin ? kScripts[best].name : nullptr;
+}
+
+// English name for a Whisper language code; Latin-script switches (es -> en)
+// need the language named, the script hint alone cannot tell them apart.
+const char* LanguageName(const std::string& code) {
+    static const char* const kNames[][2] = {
+        {"en", "English"}, {"es", "Spanish"}, {"ru", "Russian"}, {"fr", "French"},
+        {"de", "German"},  {"it", "Italian"}, {"pt", "Portuguese"}, {"nl", "Dutch"},
+        {"pl", "Polish"},  {"uk", "Ukrainian"}, {"tr", "Turkish"}, {"ar", "Arabic"},
+        {"he", "Hebrew"},  {"hi", "Hindi"},   {"zh", "Chinese"}, {"ja", "Japanese"},
+        {"ko", "Korean"},  {"el", "Greek"},   {"th", "Thai"},    {"sv", "Swedish"},
+    };
+    for (const auto& n : kNames) if (code == n[0]) return n[1];
+    return nullptr;
+}
+
+// Small models drift back to the language of earlier turns; a per-turn
+// reminder naming the language (from STT) and/or script keeps them in step.
+std::string LanguageReminder(const std::string& prompt, const std::string& lang) {
+    const char* name = LanguageName(lang);
+    const char* script = NonLatinScript(prompt);
+    if (!name && !script) return "";
+    std::string s = std::string("\n(Reply in ") + (name ? name : "the language of this message");
+    if (script) s += std::string(", written in ") + script + " script";
+    return s + ", not in the language of earlier turns.)";
 }
 
 }  // namespace
@@ -475,16 +516,14 @@ std::string LlamaSimpleChat::RunTurn(WhillatsSetResponseCallback& callback, int 
 }
 
 std::string LlamaSimpleChat::generate(const std::string &prompt,
-                                      WhillatsSetResponseCallback callback) {
+                                      WhillatsSetResponseCallback callback,
+                                      const std::string& lang) {
     if (!ctx_ || !vocab_ || !smpl_) { LOG_E("generate: not initialized"); return ""; }
     continue_ = true;
     _lastResponseStart = std::chrono::steady_clock::now();
 
     std::vector<llama_token> toks = Tokenize(UserPrefix(), false, true);
-    // Small models drift back to the language of earlier turns; a per-turn
-    // reminder keeps non-Latin-script speakers (ru, uk, zh, ar, ...) answered in kind.
-    std::vector<llama_token> body = Tokenize(
-        IsMostlyNonLatin(prompt) ? prompt + "\n(Reply in the language of this message.)" : prompt, false, false);
+    std::vector<llama_token> body = Tokenize(prompt + LanguageReminder(prompt, lang), false, false);
     std::vector<llama_token> tail = Tokenize(UserSuffix(), false, true);
     toks.insert(toks.end(), body.begin(), body.end());
     toks.insert(toks.end(), tail.begin(), tail.end());
@@ -494,17 +533,18 @@ std::string LlamaSimpleChat::generate(const std::string &prompt,
 }
 
 std::string LlamaSimpleChat::generateFromImage(YUVData* yuv, const std::string& prompt,
-                                               WhillatsSetResponseCallback callback) {
-    if (!ctx_mtmd_ || !yuv || !yuv->y || !yuv->u || !yuv->v) return generate(prompt, callback);
+                                               WhillatsSetResponseCallback callback,
+                                               const std::string& lang) {
+    if (!ctx_mtmd_ || !yuv || !yuv->y || !yuv->u || !yuv->v) return generate(prompt, callback, lang);
     if (!ctx_ || !vocab_ || !smpl_) { LOG_E("generateFromImage: not initialized"); return ""; }
     continue_ = true;
     _lastResponseStart = std::chrono::steady_clock::now();
 
     int w = 0, h = 0;
     std::vector<uint8_t> rgb = YuvToRgb(*yuv, kImageMaxSide, w, h);
-    if (rgb.empty()) return generate(prompt, callback);
+    if (rgb.empty()) return generate(prompt, callback, lang);
     mtmd::bitmap bitmap(w, h, rgb.data());
-    if (!bitmap.ptr) return generate(prompt, callback);
+    if (!bitmap.ptr) return generate(prompt, callback, lang);
 
     // User text cannot be parsed for specials here, so neutralise marker look-alikes.
     const std::string marker = mtmd_default_marker();
@@ -513,13 +553,13 @@ std::string LlamaSimpleChat::generateFromImage(YUVData* yuv, const std::string& 
                                    std::string("<end_of_turn>"), marker}) {
         for (size_t pos; (pos = text.find(bad)) != std::string::npos;) text.erase(pos, bad.size());
     }
-    const std::string full = UserPrefix() + marker + "\n" + text + UserSuffix();
+    const std::string full = UserPrefix() + marker + "\n" + text + LanguageReminder(text, lang) + UserSuffix();
     mtmd_input_text input_text = { full.c_str(), full.size(), false, true };
     const mtmd_bitmap* bitmaps[] = { bitmap.ptr.get() };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
     if (!chunks.ptr || mtmd_tokenize(ctx_mtmd_.get(), chunks.ptr.get(), &input_text, bitmaps, 1) != 0) {
         LOG_E("mtmd_tokenize failed");
-        return generate(prompt, callback);
+        return generate(prompt, callback, lang);
     }
 
     if (!PrepareTurn((int)mtmd_helper_get_n_pos(chunks.ptr.get()))) return "";
@@ -660,11 +700,11 @@ void LlamaDeviceBase::stop() {
         _processingThread.join();
 }
 
-void LlamaDeviceBase::askLlama(const char* prompt) {
+void LlamaDeviceBase::askLlama(const char* prompt, const char* lang) {
     if (!prompt || !*prompt || !_running) return;
     if (_chat) _chat->StopGeneration();  // barge-in: newest utterance wins
 
-    Request req{prompt, nullptr};
+    Request req{prompt, nullptr, lang ? lang : ""};
     if (_hasMultimodalModel) {
         std::lock_guard<std::mutex> lk(_frameMutex);
         if (_lastFrame && std::chrono::steady_clock::now() - _lastFrameTime <=
@@ -722,8 +762,8 @@ bool LlamaDeviceBase::RunProcessingThread() {
         LOG_I("LlamaDeviceBase: prompt='" << req.prompt.substr(0, 80) << "'"
               << (req.yuv ? " [+image]" : ""));
 
-        if (req.yuv) _chat->generateFromImage(req.yuv.get(), req.prompt, cb);
-        else         _chat->generate(req.prompt, cb);
+        if (req.yuv) _chat->generateFromImage(req.yuv.get(), req.prompt, cb, req.lang);
+        else         _chat->generate(req.prompt, cb, req.lang);
         cb.OnResponseComplete(false, nullptr);  // signal done
     }
     return true;

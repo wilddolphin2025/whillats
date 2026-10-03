@@ -57,8 +57,10 @@ public:
   bool Initialize();
   // Both keep the running conversation in the KV cache; old turns are shifted
   // out (system prompt preserved) when the context fills up.
-  std::string generate(const std::string& request, WhillatsSetResponseCallback callback);
-  std::string generateFromImage(YUVData* yuv, const std::string& prompt, WhillatsSetResponseCallback callback);
+  std::string generate(const std::string& request, WhillatsSetResponseCallback callback,
+                       const std::string& lang = "");
+  std::string generateFromImage(YUVData* yuv, const std::string& prompt, WhillatsSetResponseCallback callback,
+                                const std::string& lang = "");
   void ResetConversation();
 
   bool InitializeContext();
@@ -130,7 +132,8 @@ public:
   const std::string& modelPath() const { return _model_path; }
   const std::string& mmprojPath() const { return _mmproj_path; }
 
-  void askLlama(const char* prompt);
+  // lang: STT language code of the utterance (optional), named in the reply reminder.
+  void askLlama(const char* prompt, const char* lang = nullptr);
   void receiveVideoFrame(const YUVData& yuv);
 
   bool hasMultimodalSupport() const { return _hasMultimodalModel; }
@@ -152,6 +155,7 @@ private:
   struct Request {
     std::string prompt;
     std::shared_ptr<YUVData> yuv; // null = text only
+    std::string lang;
   };
   std::deque<Request> _requestQueue;
   std::mutex _queueMutex;

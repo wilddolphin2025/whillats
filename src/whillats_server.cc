@@ -193,7 +193,8 @@ int main(int argc, char* argv[]) {
             if (llama && h.len > 0) {
                 std::vector<char> prompt_buf(h.len + 1, '\0');
                 memcpy(prompt_buf.data(), payload.data(), h.len);
-                llama->askLlama(prompt_buf.data());
+                size_t n = strlen(prompt_buf.data());
+                llama->askLlama(prompt_buf.data(), n < h.len ? prompt_buf.data() + n + 1 : nullptr);
             }
             break;
         }
