@@ -676,7 +676,10 @@ void LlamaDeviceBase::askLlama(const char* prompt) {
     }
     {
         std::lock_guard<std::mutex> lk(_queueMutex);
-        _requestQueue.clear();
+        // Drop stale prompts but keep pending conversation resets.
+        _requestQueue.erase(std::remove_if(_requestQueue.begin(), _requestQueue.end(),
+                                           [](const Request& r) { return !r.prompt.empty(); }),
+                            _requestQueue.end());
         _requestQueue.push_back(std::move(req));
     }
     _queueCondition.notify_one();
