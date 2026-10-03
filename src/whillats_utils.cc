@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <cstdint>
+#include <inttypes.h>
 #include <memory>
 #include <span>
 #include <cstdio>
@@ -89,7 +90,7 @@ std::string compute_image_hash(const clip_image_u8& image) {
         }
     }
     char hash_buf[32];
-    snprintf(hash_buf, sizeof(hash_buf), "%016lx", hash);
+    snprintf(hash_buf, sizeof(hash_buf), "%016" PRIx64, hash);
     return std::string(hash_buf);
 }
 
