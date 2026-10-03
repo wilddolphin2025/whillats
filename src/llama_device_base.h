@@ -27,11 +27,11 @@
 #include <algorithm>
 #include <memory>
 #include <chrono>
+#include <mutex>
 
 #include "whillats.h"
 #include "whisper_helpers.h"
 #include "llama.h"
-#include "clip.h"
 #include "mtmd.h"
 
 struct llama_model;
@@ -47,18 +47,19 @@ public:
 
   LlamaSimpleChat(const LlamaSimpleChat&) = delete;
   LlamaSimpleChat& operator=(const LlamaSimpleChat&) = delete;
-  LlamaSimpleChat(LlamaSimpleChat&&) = delete;
-  LlamaSimpleChat& operator=(LlamaSimpleChat&&) = delete;
 
   bool SetModelPaths(const std::string &path, const std::string &mmproj_path);
   bool SetNGL(int layers);
   bool SetContextSize(int size);
-  void SetThreadCount(int n) { n_threads_ = n; }
+  void SetThreadCount(int n);
   void StopGeneration();
 
   bool Initialize();
+  // Both keep the running conversation in the KV cache; old turns are shifted
+  // out (system prompt preserved) when the context fills up.
   std::string generate(const std::string& request, WhillatsSetResponseCallback callback);
   std::string generateFromImage(YUVData* yuv, const std::string& prompt, WhillatsSetResponseCallback callback);
+  void ResetConversation();
 
   bool InitializeContext();
   void FreeContext();
@@ -66,10 +67,9 @@ public:
 
   std::string model_path_;
   std::string mmproj_path_;
-  int ngl_ = 10;
-  int n_predict_ = 4096;
+  int ngl_ = 999;
+  int n_ctx_ = 4096;
   int n_threads_ = 0;
-  std::string prompt_ = "You are a helpful assistant.";
 
   llama_model* model_ = nullptr;
   const llama_vocab* vocab_ = nullptr;
@@ -81,8 +81,9 @@ public:
   std::unique_ptr<mtmd_context, MtmdContextDeleter> ctx_mtmd_;
 
   llama_sampler* smpl_ = nullptr;
-  std::deque<llama_token> context_tokens_;
-  int n_past_ = 0;
+  int n_past_ = 0;   // tokens currently in the KV cache
+  int n_sys_ = 0;    // leading tokens that are never shifted out
+  bool image_in_context_ = false;
   std::atomic<bool> continue_{true};
 
   enum class ChatFormat { GEMMA, GEMMA4, CHATML, LLAMA3 };
@@ -97,7 +98,17 @@ public:
   void DetectChatFormat();
   bool isRepetitive(const std::string &text, size_t minPatternLength = 5);
   bool isCompleteSentence(const std::string &text);
-  bool ResetContextForImage();
+
+private:
+  std::vector<llama_token> Tokenize(const std::string& text, bool add_bos, bool special) const;
+  bool Feed(std::vector<llama_token> tokens);
+  bool EnsureRoom(int n_tokens);
+  bool BeginConversation();
+  bool PrepareTurn(int n_tokens);
+  void CloseTurn();
+  std::string UserPrefix() const;
+  std::string UserSuffix() const;
+  std::string RunTurn(WhillatsSetResponseCallback& callback, int max_tokens, int min_gen);
 };
 
 class LlamaDeviceBase {
@@ -107,10 +118,17 @@ public:
                   WhillatsSetResponseCallback callback);
   virtual ~LlamaDeviceBase();
 
+  // start() after stop() reuses the loaded weights, so barge-in and
+  // back-to-back calls do not pay the model load again.
   bool start();
   void stop();
   bool isRunning() const { return _running; }
-  void setThreadCount(int n) { if (_chat) _chat->SetThreadCount(n); }
+  void setThreadCount(int n);
+  void setCallback(WhillatsSetResponseCallback cb);
+  void resetConversation();
+
+  const std::string& modelPath() const { return _model_path; }
+  const std::string& mmprojPath() const { return _mmproj_path; }
 
   void askLlama(const char* prompt);
   void receiveVideoFrame(const YUVData& yuv);
@@ -121,9 +139,11 @@ private:
   std::string _model_path;
   std::string _mmproj_path;
   WhillatsSetResponseCallback _responseCallback;
+  std::mutex _callbackMutex;
   std::unique_ptr<LlamaSimpleChat> _chat;
+  int _threadCount = 0;
 
-  bool _running = false;
+  std::atomic<bool> _running{false};
   bool _hasMultimodalModel = false;
   int _imageRetentionMs = 5000;
 

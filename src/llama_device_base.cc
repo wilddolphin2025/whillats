@@ -23,17 +23,16 @@
 #include <cstring>
 #include <memory>
 #include <cstdlib>
+#include <cctype>
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
 
 #include "llama.h"
-#include "clip.h"
 #include "mtmd.h"
 #include "llama_device_base.h"
 #include "whisper_helpers.h"
-#include "whillats_utils.h"
 #include "mtmd-helper.h"
 
 #ifdef GGML_USE_CUDA
@@ -48,14 +47,16 @@ static std::string strip_markdown(const std::string& s) {
     std::string out;
     out.reserve(s.size());
     size_t i = 0;
+    bool line_start = true;
     while (i < s.size()) {
-        // Skip heading markers at start of token (# ## ###)
-        if (i == 0 || out.empty() || out.back() == '\n') {
+        // Skip heading markers at line start (# ## ###)
+        if (line_start && s[i] == '#') {
             while (i < s.size() && s[i] == '#') ++i;
             while (i < s.size() && s[i] == ' ') ++i;
             continue;
         }
         char c = s[i];
+        line_start = (c == '\n');
         // Bold/italic: ** or * or _ — skip the markers, keep the text
         if ((c == '*' || c == '_') ) {
             // peek ahead to find matching marker and strip both
@@ -105,7 +106,8 @@ static std::string clean_response(const std::string& response) {
     // Remove special tokens
     static const std::regex re_ctrl(
         "<\\|eot_id\\|>|<\\|im_end\\|>|<\\|endoftext\\|>|<end_of_turn>"
-        "|<start_of_turn>[^<]*>?|<turn\\|>|<think>[\\s\\S]*?</think>");
+        "|<start_of_turn>[^<]*>?|<turn\\|>|<think>[\\s\\S]*?</think>"
+        "|<\\|channel>[\\s\\S]*?<channel\\|>|<\\|?channel\\|?>");
     cleaned = std::regex_replace(cleaned, re_ctrl, "");
     // Strip markdown
     cleaned = strip_markdown(cleaned);
@@ -118,19 +120,66 @@ static std::string clean_response(const std::string& response) {
     return cleaned;
 }
 
-uint64_t fnv1a_hash_yuv(const YUVData &yuv) {
-    const uint64_t FNV_offset_basis = 1469598103934665603ull;
-    const uint64_t FNV_prime        = 1099511628211ull;
-    uint64_t h = FNV_offset_basis;
-    for (size_t i = 0; i < yuv.y_size;  ++i) h = (h ^ yuv.y[i]) * FNV_prime;
-    for (size_t i = 0; i < yuv.uv_size; ++i) h = (h ^ yuv.u[i]) * FNV_prime;
-    for (size_t i = 0; i < yuv.uv_size; ++i) h = (h ^ yuv.v[i]) * FNV_prime;
-    return h;
-}
 
 // ============================================================================
 // LlamaSimpleChat
 // ============================================================================
+
+namespace {
+
+const char* kInstruction =
+    "You are a friendly voice assistant on a live phone or video call. "
+    "Always reply in the language of the user's latest message, even if earlier turns used another language. "
+    "Keep replies to one or two short spoken sentences. "
+    "If an image is attached it is the live camera view; use it only when relevant. "
+    "Never use markdown, lists, emoji, or special formatting.";
+
+constexpr int kMaxReplyTokens = 256;
+constexpr int kMaxImageReplyTokens = 160;
+constexpr int kImageMaxTokens = 256;  // caps vision tokens per frame on the phone
+
+constexpr int kImageMaxSide = 448;
+
+// I420 -> packed RGB, nearest-neighbour downscaled so the long side is at most
+// max_side (aspect ratio kept; the projector does its own final resize).
+std::vector<uint8_t> YuvToRgb(const YUVData& yuv, int max_side, int& w, int& h) {
+    if (!yuv.y || !yuv.u || !yuv.v || yuv.width <= 1 || yuv.height <= 1) return {};
+    const float scale = std::min(1.0f, (float)max_side / std::max(yuv.width, yuv.height));
+    w = std::max(1, (int)(yuv.width * scale));
+    h = std::max(1, (int)(yuv.height * scale));
+    const int cw = (yuv.width + 1) / 2;
+    std::vector<uint8_t> rgb((size_t)w * h * 3);
+    uint8_t* out = rgb.data();
+    auto clamp = [](int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); };
+    for (int y = 0; y < h; ++y) {
+        const int sy = std::min(yuv.height - 1, (int)(y / scale));
+        for (int x = 0; x < w; ++x) {
+            const int sx = std::min(yuv.width - 1, (int)(x / scale));
+            const int c = (yuv.y[(size_t)sy * yuv.width + sx] - 16) * 298 + 128;
+            const size_t uv = (size_t)(sy / 2) * cw + sx / 2;
+            const int d = yuv.u[uv] - 128, e = yuv.v[uv] - 128;
+            *out++ = clamp((c + 409 * e) >> 8);
+            *out++ = clamp((c - 100 * d - 208 * e) >> 8);
+            *out++ = clamp((c + 516 * d) >> 8);
+        }
+    }
+    return rgb;
+}
+
+bool IsMostlyNonLatin(const std::string& s) {
+    int latin = 0, other = 0;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = s[i];
+        if (c < 0x80) { latin += std::isalpha(c) ? 1 : 0; ++i; continue; }
+        const int len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+        // U+0080..U+036F (2-byte lead < 0xCD) are Latin accents, not another script.
+        if (c >= 0xCD) ++other; else ++latin;
+        i += len;
+    }
+    return other > latin;
+}
+
+}  // namespace
 
 LlamaSimpleChat::LlamaSimpleChat() = default;
 
@@ -147,8 +196,13 @@ bool LlamaSimpleChat::SetModelPaths(const std::string &path, const std::string &
 }
 
 bool LlamaSimpleChat::SetNGL(int layers) { ngl_ = layers; return true; }
-bool LlamaSimpleChat::SetContextSize(int size) { n_predict_ = size; return true; }
+bool LlamaSimpleChat::SetContextSize(int size) { n_ctx_ = size; return true; }
 void LlamaSimpleChat::StopGeneration() { continue_ = false; }
+
+void LlamaSimpleChat::SetThreadCount(int n) {
+    n_threads_ = n;
+    if (ctx_ && n > 0) llama_set_n_threads(ctx_, n, n);
+}
 
 bool LlamaSimpleChat::Initialize() {
     llama_backend_init();
@@ -157,38 +211,24 @@ bool LlamaSimpleChat::Initialize() {
     if (smpl_) llama_sampler_free(smpl_);
     smpl_ = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (!smpl_) { LOG_E("Failed to initialize sampler."); return false; }
-    llama_sampler_chain_add(smpl_, llama_sampler_init_top_k(50));
+    llama_sampler_chain_add(smpl_, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(smpl_, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl_, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(smpl_, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     DetectStoppingTokens();
     DetectChatFormat();
-    return true;
+    return BeginConversation();
 }
 
 bool LlamaSimpleChat::LoadModel() {
     if (model_path_.empty()) { LOG_E("Model path not set."); return false; }
 
     llama_model_params model_params = llama_model_default_params();
-#ifdef GGML_USE_METAL
-    const char *env_ngl = std::getenv("LLAMA_METAL_GPU_LAYERS");
-    bool env_valid = false;
-    if (env_ngl) {
-        int env_val = std::atoi(env_ngl);
-        if (env_val >= 0) { model_params.n_gpu_layers = env_val; env_valid = true; }
-    }
-    if (!env_valid) {
-        size_t mem_bytes = 0;
 #ifdef __APPLE__
-        size_t len = sizeof(mem_bytes);
-        sysctlbyname("hw.memsize", &mem_bytes, &len, nullptr, 0);
-#endif
-        size_t mem_gb = mem_bytes / (1024ULL * 1024ULL * 1024ULL);
-        int max_layers = (mem_gb >= 32) ? 32 : (mem_gb >= 24) ? 24 :
-                         (mem_gb >= 16) ? 16 : (mem_gb >= 12) ? 12 :
-                         (mem_gb >= 8)  ? 8  : 0;
-        model_params.n_gpu_layers = std::min(ngl_, max_layers);
-    }
+    // Unified memory: Metal maps the same mmap'd weights the CPU would use, so
+    // full offload costs no extra RAM and is several times faster on A/M chips.
+    const char *env_ngl = std::getenv("LLAMA_METAL_GPU_LAYERS");
+    model_params.n_gpu_layers = (env_ngl && std::atoi(env_ngl) >= 0) ? std::atoi(env_ngl) : ngl_;
 #elif defined(GGML_USE_CUDA)
     size_t free_mem, total_mem;
     cudaError_t cuda_err = cudaMemGetInfo(&free_mem, &total_mem);
@@ -219,20 +259,15 @@ bool LlamaSimpleChat::LoadModel() {
 bool LlamaSimpleChat::InitializeContext() {
     if (ctx_) FreeContext();
     if (!model_ || !vocab_) { LOG_E("Model or vocab not loaded."); return false; }
-
-    // Don't pre-seed context — chat system prompt is handled in generate()
-    context_tokens_.clear();
-    n_past_ = 0;
+    n_past_ = n_sys_ = 0;
+    image_in_context_ = false;
 
     llama_context_params ctx_params = llama_context_default_params();
-#ifdef GGML_USE_METAL
-    ctx_params.n_ctx   = std::min(n_predict_, 1024);
-    ctx_params.n_batch = 256;
-#else
-    ctx_params.n_ctx   = std::min(n_predict_, 2048);
+    ctx_params.n_ctx   = std::min<int>(n_ctx_, llama_model_n_ctx_train(model_));
     ctx_params.n_batch = 512;
-#endif
-    ctx_params.no_perf = false;
+    ctx_params.n_ubatch = 512;
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    ctx_params.no_perf = true;
 
 #if defined(__APPLE__)
     int perf_cores = 0;
@@ -245,391 +280,261 @@ bool LlamaSimpleChat::InitializeContext() {
     ctx_params.n_threads = std::max(1u, std::thread::hardware_concurrency());
 #endif
     if (n_threads_ > 0) ctx_params.n_threads = n_threads_;
+    ctx_params.n_threads_batch = ctx_params.n_threads;
 
     ctx_ = llama_init_from_model(model_, ctx_params);
     if (!ctx_) { LOG_E("Failed to create llama_context."); return false; }
 
     if (!mmproj_path_.empty()) {
         mtmd_context_params mtmd_params = mtmd_context_params_default();
-        mtmd_params.n_threads = ctx_params.n_threads;
-        mtmd_params.use_gpu   = true;
+        mtmd_params.n_threads        = ctx_params.n_threads;
+        mtmd_params.use_gpu          = true;
+        mtmd_params.print_timings    = false;
+        mtmd_params.flash_attn_type  = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        mtmd_params.image_max_tokens = kImageMaxTokens;
         ctx_mtmd_.reset(mtmd_init_from_file(mmproj_path_.c_str(), model_, mtmd_params));
-        if (!ctx_mtmd_) {
-            LOG_E("Failed to load MMProj model");
-            llama_model_free(model_);
-            model_ = nullptr;
-            return false;
-        }
-    }
-
-    if (!context_tokens_.empty() && n_past_ == 0) {
-        int n_eval  = context_tokens_.size();
-        int n_batch = ctx_params.n_batch;
-        for (int i = 0; i < n_eval; i += n_batch) {
-            int n_tokens = std::min(n_batch, n_eval - i);
-            struct llama_batch batch = llama_batch_get_one(&context_tokens_[i], n_tokens);
-            if (llama_decode(ctx_, batch)) { LOG_E("Failed to decode context."); FreeContext(); return false; }
-            n_past_ += n_tokens;
-        }
-        if (smpl_) llama_sampler_reset(smpl_);
+        if (!ctx_mtmd_) LOG_E("Failed to load MMProj model; continuing text-only");
     }
     return true;
 }
 
 void LlamaSimpleChat::FreeContext() {
-    if (ctx_) { llama_free(ctx_); ctx_ = nullptr; }
     ctx_mtmd_.reset();
-}
-
-bool LlamaSimpleChat::ResetContextForImage() {
-    if (!ctx_) { LOG_E("Context not initialized"); return false; }
-    llama_memory_t memory = llama_get_memory(ctx_);
-    llama_memory_clear(memory, true);
-    context_tokens_.clear();
-    n_past_ = 0;
-    if (smpl_) llama_sampler_reset(smpl_);
-    return true;
+    if (ctx_) { llama_free(ctx_); ctx_ = nullptr; }
 }
 
 bool LlamaSimpleChat::isRepetitive(const std::string &text, size_t minPatternLength) {
     if (text.length() < minPatternLength * 2) return false;
     for (size_t len = minPatternLength; len <= text.length() / 2; ++len) {
-        std::string last = text.substr(text.length() - len);
-        if (text.rfind(last, text.length() - len - 1) != std::string::npos) return true;
+        if (text.compare(text.length() - 2 * len, len, text, text.length() - len, len) == 0) return true;
     }
     return false;
 }
 
 bool LlamaSimpleChat::isCompleteSentence(const std::string &text) {
-    if (text.empty()) return false;
-    char last = text.back();
-    return (last == '.' || last == '!' || last == '?') &&
-           !std::all_of(text.begin(), text.end(), isspace);
+    size_t end = text.find_last_not_of(" \n\r\t\"')");
+    if (end == std::string::npos) return false;
+    char last = text[end];
+    return last == '.' || last == '!' || last == '?' || last == '\n';
 }
 
 // ---------------------------------------------------------------------------
-// System prompt: Gemma-4 format, no markdown, voice-friendly
+// Prompt building. Markers are tokenized with parse_special=true; user text
+// is tokenized with parse_special=false so it can never inject chat markers.
 // ---------------------------------------------------------------------------
-static std::string make_system_prompt(LlamaSimpleChat::ChatFormat fmt) {
-    const std::string instruction =
-        "You are a helpful multilingual voice assistant. "
-        "Always respond in the same language the user speaks. "
-        "Keep answers short and conversational. "
-        "Never use markdown, bullet points, asterisks, or any special formatting. "
-        "Speak in plain sentences only.";
 
-    if (fmt == LlamaSimpleChat::ChatFormat::GEMMA4) {
-        // Gemma-4 (unsloth): <|turn>system\n...<turn|>\n
-        return "<|turn>system\n" + instruction + "<turn|>\n";
-    } else if (fmt == LlamaSimpleChat::ChatFormat::GEMMA) {
-        // Classic Gemma: no system role — prime via a user/model exchange
-        return "<start_of_turn>user\n" + instruction + "<end_of_turn>\n"
-               "<start_of_turn>model\nUnderstood.<end_of_turn>\n";
-    } else if (fmt == LlamaSimpleChat::ChatFormat::CHATML) {
-        return "<|im_start|>system\n" + instruction + "<|im_end|>\n";
-    } else {
-        return "<|start_header_id|>system<|end_header_id|>\n\n" + instruction + "<|eot_id|>\n";
+std::vector<llama_token> LlamaSimpleChat::Tokenize(const std::string& text, bool add_bos, bool special) const {
+    int n = -llama_tokenize(vocab_, text.c_str(), (int)text.size(), nullptr, 0, add_bos, special);
+    std::vector<llama_token> out(std::max(n, 0));
+    if (n > 0 && llama_tokenize(vocab_, text.c_str(), (int)text.size(), out.data(), n, add_bos, special) < 0)
+        out.clear();
+    return out;
+}
+
+std::string LlamaSimpleChat::UserPrefix() const {
+    switch (chat_format_) {
+        case ChatFormat::GEMMA4: return "<|turn>user\n";
+        case ChatFormat::GEMMA:  return "<start_of_turn>user\n";
+        case ChatFormat::CHATML: return "<|im_start|>user\n";
+        default:                 return "<|start_header_id|>user<|end_header_id|>\n\n";
     }
 }
 
-// ---------------------------------------------------------------------------
-// generate() — text-only inference, sentence-by-sentence streaming to TTS
-// ---------------------------------------------------------------------------
-std::string LlamaSimpleChat::generate(const std::string &prompt,
-                                       WhillatsSetResponseCallback callback) {
-    if (!ctx_ || !vocab_ || !smpl_) {
-        LOG_E("generate: context/vocab/sampler not ready.");
-        return "";
+std::string LlamaSimpleChat::UserSuffix() const {
+    switch (chat_format_) {
+        case ChatFormat::GEMMA4: return "<turn|>\n<|turn>model\n";
+        case ChatFormat::GEMMA:  return "<end_of_turn>\n<start_of_turn>model\n";
+        case ChatFormat::CHATML: return "<|im_end|>\n<|im_start|>assistant\n";
+        default:                 return "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
     }
+}
 
-    // Initialize context with system prompt on first call
-    if (context_tokens_.empty()) {
-        // DetectChatFormat already run; build proper system prompt
-        std::string system_prompt = make_system_prompt(chat_format_);
-        const int n_sp = -llama_tokenize(vocab_, system_prompt.c_str(), system_prompt.size(),
-                                          nullptr, 0, true, true);
-        if (n_sp > 0) {
-            std::vector<llama_token> sp_tokens(n_sp);
-            if (llama_tokenize(vocab_, system_prompt.c_str(), system_prompt.size(),
-                               sp_tokens.data(), sp_tokens.size(), true, true) >= 0) {
-                context_tokens_ = std::deque<llama_token>(sp_tokens.begin(), sp_tokens.end());
-                n_past_ = 0;
-                int n_batch = llama_context_default_params().n_batch;
-                for (int i = 0; i < (int)context_tokens_.size(); i += n_batch) {
-                    int n_tok = std::min(n_batch, (int)context_tokens_.size() - i);
-                    struct llama_batch batch = llama_batch_get_one(&context_tokens_[i], n_tok);
-                    if (llama_decode(ctx_, batch)) { LOG_E("Failed to decode system prompt."); return ""; }
-                    n_past_ += n_tok;
-                }
-            }
+void LlamaSimpleChat::CloseTurn() {
+    const char* eot = chat_format_ == ChatFormat::GEMMA4 ? "<turn|>\n"
+                    : chat_format_ == ChatFormat::GEMMA  ? "<end_of_turn>\n"
+                    : chat_format_ == ChatFormat::CHATML ? "<|im_end|>\n" : "<|eot_id|>";
+    Feed(Tokenize(eot, false, true));
+}
+
+bool LlamaSimpleChat::Feed(std::vector<llama_token> tokens) {
+    if (tokens.empty()) return true;
+    if (!EnsureRoom((int)tokens.size())) return false;
+    const int n_batch = (int)llama_n_batch(ctx_);
+    for (size_t i = 0; i < tokens.size(); i += n_batch) {
+        int n = std::min<int>(n_batch, (int)(tokens.size() - i));
+        if (llama_decode(ctx_, llama_batch_get_one(&tokens[i], n))) { LOG_E("llama_decode failed"); return false; }
+        n_past_ += n;
+    }
+    return true;
+}
+
+// Makes room for n_tokens by dropping the oldest half of the conversation
+// (system prompt kept). Image embeddings use non-linear positions (M-RoPE)
+// and cannot be shifted, so those conversations are restarted instead.
+bool LlamaSimpleChat::EnsureRoom(int n_tokens) {
+    const int n_ctx = (int)llama_n_ctx(ctx_);
+    if (n_past_ + n_tokens <= n_ctx) return true;
+    llama_memory_t mem = llama_get_memory(ctx_);
+    const int n_hist = n_past_ - n_sys_;
+    if (image_in_context_ || !llama_memory_can_shift(mem) || n_hist <= 0 ||
+        n_sys_ + n_hist / 2 + n_tokens > n_ctx) {
+        return false;
+    }
+    const int n_discard = std::max(n_hist / 2, n_past_ + n_tokens - n_ctx);
+    llama_memory_seq_rm(mem, 0, n_sys_, n_sys_ + n_discard);
+    llama_memory_seq_add(mem, 0, n_sys_ + n_discard, n_past_, -n_discard);
+    n_past_ -= n_discard;
+    LOG_I("LlamaSimpleChat: context shift, dropped " << n_discard << " tokens");
+    return true;
+}
+
+bool LlamaSimpleChat::BeginConversation() {
+    llama_memory_clear(llama_get_memory(ctx_), true);
+    n_past_ = n_sys_ = 0;
+    image_in_context_ = false;
+    llama_sampler_reset(smpl_);
+
+    std::string sys;
+    switch (chat_format_) {
+        case ChatFormat::GEMMA4: sys = std::string("<|turn>system\n") + kInstruction + "<turn|>\n"; break;
+        case ChatFormat::GEMMA:
+            sys = std::string("<start_of_turn>user\n") + kInstruction +
+                  "<end_of_turn>\n<start_of_turn>model\nUnderstood.<end_of_turn>\n";
+            break;
+        case ChatFormat::CHATML: sys = std::string("<|im_start|>system\n") + kInstruction + "<|im_end|>\n"; break;
+        default: sys = std::string("<|start_header_id|>system<|end_header_id|>\n\n") + kInstruction + "<|eot_id|>"; break;
+    }
+    if (!Feed(Tokenize(sys, true, true))) return false;
+    n_sys_ = n_past_;
+    return true;
+}
+
+void LlamaSimpleChat::ResetConversation() {
+    if (ctx_ && smpl_) BeginConversation();
+}
+
+bool LlamaSimpleChat::PrepareTurn(int n_tokens) {
+    const int need = n_tokens + kMaxReplyTokens + 8;
+    if (EnsureRoom(need)) return true;
+    LOG_I("LlamaSimpleChat: context full, starting a new conversation");
+    return BeginConversation() && n_past_ + need <= (int)llama_n_ctx(ctx_);
+}
+
+// Shared sampling loop. Streams each finished sentence to the callback so TTS
+// starts speaking while the rest of the reply is still being generated.
+std::string LlamaSimpleChat::RunTurn(WhillatsSetResponseCallback& callback, int max_tokens, int min_gen) {
+    std::string response, phrase, recent;
+    int generated = 0, repeats = 0;
+    bool in_thought = false;
+    char piece_buf[128];
+
+    auto flush = [&](bool force) {
+        if (phrase.empty() || (!force && !isCompleteSentence(phrase))) return;
+        std::string cleaned = clean_response(phrase);
+        if (!cleaned.empty()) {
+            callback.OnResponseComplete(true, cleaned.c_str());
+            LOG_I("LlamaSimpleChat: '" << cleaned << "' in "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - _lastResponseStart).count() << "ms");
         }
-    }
-
-    // Wrap prompt in chat template
-    std::string wrapped;
-    if (chat_format_ == ChatFormat::GEMMA4) {
-        wrapped = "<|turn>user\n" + prompt + "<turn|>\n<|turn>model\n";
-    } else if (chat_format_ == ChatFormat::GEMMA) {
-        wrapped = "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n";
-    } else if (chat_format_ == ChatFormat::CHATML) {
-        wrapped = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-    } else {
-        wrapped = "<|start_header_id|>user<|end_header_id|>\n\n" + prompt +
-                  "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-    }
-
-    const int n_tokens = -llama_tokenize(vocab_, wrapped.c_str(), wrapped.size(), nullptr, 0, false, false);
-    if (n_tokens < 0) { LOG_E("Failed to count prompt tokens."); return ""; }
-    std::vector<llama_token> prompt_tokens(n_tokens);
-    if (llama_tokenize(vocab_, wrapped.c_str(), wrapped.size(),
-                       prompt_tokens.data(), prompt_tokens.size(), false, false) < 0) {
-        LOG_E("Failed to tokenize prompt."); return "";
-    }
-
-    context_tokens_.insert(context_tokens_.end(), prompt_tokens.begin(), prompt_tokens.end());
-
-    // Trim context if too long
-    if ((int)context_tokens_.size() > n_predict_) {
-        int excess = context_tokens_.size() - n_predict_;
-        context_tokens_.erase(context_tokens_.begin(), context_tokens_.begin() + excess);
-        n_past_ = std::max(0, n_past_ - excess);
-        if (!InitializeContext()) { LOG_E("Context reinit failed."); return ""; }
-    }
-
-    // Decode new prompt tokens
-    if (!prompt_tokens.empty()) {
-        struct llama_batch batch = llama_batch_get_one(prompt_tokens.data(), (int)prompt_tokens.size());
-        if (llama_decode(ctx_, batch)) { LOG_E("Failed to decode prompt."); return ""; }
-        n_past_ += (int)prompt_tokens.size();
-    }
-
-    std::string response;
-    std::string current_phrase;
-    std::string recent_text;
-    continue_ = true;
-    int generated = 0;
-    int repetition_count = 0;
-    const int max_tokens = 512;
-
-    _lastResponseStart = std::chrono::steady_clock::now();
+        response += phrase;
+        phrase.clear();
+    };
 
     while (continue_ && generated < max_tokens) {
-        if (!smpl_ || !ctx_) break;
+        llama_token tok = llama_sampler_sample(smpl_, ctx_, -1);
+        const bool is_stop = llama_vocab_is_eog(vocab_, tok) ||
+                             (generated >= min_gen && stopping_token_ids_.count(tok));
+        if (is_stop) break;
 
-        float *logits = llama_get_logits_ith(ctx_, -1);
-        if (!logits) break;
-
-        int n_vocab = llama_vocab_n_tokens(vocab_);
-        std::vector<llama_token_data> candidates(n_vocab);
-        for (int i = 0; i < n_vocab; ++i) candidates[i] = {i, logits[i], 0.0f};
-        llama_token_data_array cur_p = {candidates.data(), (size_t)n_vocab, -1, false};
-        llama_sampler_apply(smpl_, &cur_p);
-
-        if (cur_p.size == 0 || cur_p.selected < 0 || cur_p.selected >= (int64_t)cur_p.size) break;
-
-        llama_token new_token_id = cur_p.data[cur_p.selected].id;
-        if (llama_vocab_is_eog(vocab_, new_token_id) ||
-            stopping_token_ids_.find(new_token_id) != stopping_token_ids_.end()) break;
-
-        char piece_buf[64];
-        int piece_len = llama_token_to_piece(vocab_, new_token_id, piece_buf, sizeof(piece_buf), 0, true);
-        if (piece_len < 0) break;
-
-        std::string piece(piece_buf, piece_len);
-
-        // Check for stopping strings
-        bool stop = false;
-        for (const auto &ss : stopping_token_strings_) {
-            if (piece.find(ss) != std::string::npos) { stop = true; break; }
-        }
-        if (stop) break;
-
-        current_phrase += piece;
-        recent_text    += piece;
-        if (recent_text.length() > 50) recent_text = recent_text.substr(recent_text.length() - 50);
-
-        context_tokens_.push_back(new_token_id);
-        llama_sampler_accept(smpl_, new_token_id);
-
-        if (isRepetitive(recent_text, 5) && ++repetition_count > 2) break;
-        else if (!isRepetitive(recent_text, 5)) repetition_count = 0;
-
-        // Flush complete sentences to TTS immediately
-        if (isCompleteSentence(current_phrase)) {
-            std::string cleaned = clean_response(current_phrase);
-            if (!cleaned.empty()) {
-                callback.OnResponseComplete(true, cleaned.c_str());
-                LOG_I("LlamaSimpleChat: '" << cleaned << "' in "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - _lastResponseStart).count() << "ms");
-            }
-            response += current_phrase;
-            current_phrase.clear();
-        }
-
-        struct llama_batch batch = llama_batch_get_one(&new_token_id, 1);
-        if (llama_decode(ctx_, batch)) { LOG_E("Failed to decode token."); break; }
-        n_past_++;
-        generated++;
-    }
-
-    if (!current_phrase.empty()) {
-        response += current_phrase;
-        std::string cleaned = clean_response(current_phrase);
-        if (!cleaned.empty()) callback.OnResponseComplete(true, cleaned.c_str());
-    }
-
-    return clean_response(response);
-}
-
-// ---------------------------------------------------------------------------
-// generateFromImage() — multimodal inference via mtmd
-// ---------------------------------------------------------------------------
-std::string LlamaSimpleChat::generateFromImage(YUVData* yuv, const std::string& prompt,
-                                                WhillatsSetResponseCallback callback) {
-    continue_ = true;
-    if (!ctx_ || !vocab_ || !smpl_ || !ctx_mtmd_) {
-        LOG_E("generateFromImage: not initialized");
-        return "";
-    }
-    if (!yuv || !yuv->y || !yuv->u || !yuv->v) { LOG_E("Invalid YUV"); return ""; }
-
-    _lastResponseStart = std::chrono::steady_clock::now();
-    if (!ResetContextForImage()) { LOG_E("ResetContextForImage failed"); return ""; }
-
-    const std::string sys = "You are a helpful visual assistant. "
-                            "Describe what you see briefly and answer the user's question. "
-                            "Use plain speech only, no markdown or formatting symbols.";
-    int n_ctx = llama_n_ctx(ctx_);
-    std::vector<llama_token> sys_tokens(n_ctx);
-    int n_sys = llama_tokenize(vocab_, sys.c_str(), sys.size(), sys_tokens.data(), sys_tokens.size(), true, false);
-    if (n_sys <= 0) { LOG_E("Failed to tokenize system prompt"); return ""; }
-    sys_tokens.resize(n_sys);
-    context_tokens_ = std::deque<llama_token>(sys_tokens.begin(), sys_tokens.end());
-
-    int max_batch = 512;
-#ifdef GGML_USE_METAL
-    max_batch = 256;
-#endif
-    llama_batch batch = llama_batch_init(max_batch, 0, 1);
-    if (!batch.token) { LOG_E("Failed to init batch"); return ""; }
-    batch.n_tokens = n_sys;
-    for (int i = 0; i < n_sys; ++i) {
-        batch.token[i]      = sys_tokens[i];
-        batch.pos[i]        = i;
-        batch.n_seq_id[i]   = 1;
-        batch.seq_id[i][0]  = 0;
-        batch.logits[i]     = (i == n_sys - 1);
-    }
-    if (llama_decode(ctx_, batch)) { LOG_E("System prompt decode failed"); llama_batch_free(batch); return ""; }
-    n_past_ = n_sys;
-
-    // Convert YUV → clip_image_u8
-    clip_image_u8* img_clip = yuv_to_clip(*yuv);
-    if (!img_clip) { LOG_E("YUV→clip failed"); llama_batch_free(batch); return ""; }
-
-    mtmd::bitmap bitmap(img_clip->width, img_clip->height, img_clip->data);
-    free_clip(img_clip);
-    if (!bitmap.ptr) { LOG_E("Failed to create bitmap"); llama_batch_free(batch); return ""; }
-
-    std::string full_prompt;
-    if (chat_format_ == ChatFormat::GEMMA4) {
-        full_prompt = "<|turn>user\n" + std::string(MTMD_DEFAULT_IMAGE_MARKER)
-                    + " " + prompt + "<turn|>\n<|turn>model\n";
-    } else if (chat_format_ == ChatFormat::GEMMA) {
-        full_prompt = "<start_of_turn>user\n" + std::string(MTMD_DEFAULT_IMAGE_MARKER)
-                    + " " + prompt + "<end_of_turn>\n<start_of_turn>model\n";
-    } else if (chat_format_ == ChatFormat::CHATML) {
-        full_prompt = "<|im_start|>user\n" + std::string(MTMD_DEFAULT_IMAGE_MARKER)
-                    + " " + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-    } else {
-        full_prompt = "<|start_header_id|>user<|end_header_id|>\n\n"
-                    + std::string(MTMD_DEFAULT_IMAGE_MARKER) + " " + prompt
-                    + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-    }
-
-    mtmd_input_text input_text = { full_prompt.c_str(), true, false };
-    std::vector<const mtmd_bitmap*> bitmaps = { bitmap.ptr.get() };
-    mtmd::input_chunks chunks(mtmd_input_chunks_init());
-    if (!chunks.ptr) { LOG_E("Failed to init chunks"); llama_batch_free(batch); return ""; }
-    if (mtmd_tokenize(ctx_mtmd_.get(), chunks.ptr.get(), &input_text, bitmaps.data(), bitmaps.size()) != 0) {
-        LOG_E("mtmd_tokenize failed"); llama_batch_free(batch); return "";
-    }
-
-    llama_pos new_n_past = n_past_;
-    if (mtmd_helper_eval_chunks(ctx_mtmd_.get(), ctx_, chunks.ptr.get(), n_past_, 0, max_batch, true, &new_n_past) != 0) {
-        LOG_E("mtmd eval failed"); llama_batch_free(batch); return "";
-    }
-    n_past_ = new_n_past;
-    llama_batch_free(batch);
-    if (smpl_) llama_sampler_reset(smpl_);
-
-    std::string response;
-    std::string current_phrase;
-    std::string recent_text;
-    int generated = 0;
-    int repetition_count = 0;
-    const int max_tokens = 128;
-    const int min_gen    = 10;
-
-    while (continue_ && generated < max_tokens) {
-        if (!smpl_ || !ctx_) break;
-        float *logits = llama_get_logits_ith(ctx_, -1);
-        if (!logits) break;
-
-        int n_vocab = llama_vocab_n_tokens(vocab_);
-        std::vector<llama_token_data> candidates(n_vocab);
-        for (int i = 0; i < n_vocab; ++i) candidates[i] = {i, logits[i], 0.0f};
-        llama_token_data_array cur_p = {candidates.data(), (size_t)n_vocab, -1, false};
-        llama_sampler_apply(smpl_, &cur_p);
-        if (cur_p.size == 0 || cur_p.selected < 0) break;
-
-        llama_token new_token_id = cur_p.data[cur_p.selected].id;
-        if (llama_vocab_is_eog(vocab_, new_token_id)) break;
-        if (generated > min_gen && stopping_token_ids_.find(new_token_id) != stopping_token_ids_.end()) break;
-
-        char piece_buf[64];
-        int piece_len = llama_token_to_piece(vocab_, new_token_id, piece_buf, sizeof(piece_buf), 0, true);
-        if (piece_len < 0) break;
-        std::string piece(piece_buf, piece_len);
-
-        if (generated > min_gen) {
+        int n = llama_token_to_piece(vocab_, tok, piece_buf, sizeof(piece_buf), 0, true);
+        if (n < 0) break;
+        std::string piece(piece_buf, n);
+        if (generated >= min_gen) {
             bool stop = false;
             for (const auto &ss : stopping_token_strings_)
                 if (piece.find(ss) != std::string::npos) { stop = true; break; }
             if (stop) break;
         }
 
-        current_phrase += piece;
-        recent_text    += piece;
-        if (recent_text.length() > 50) recent_text = recent_text.substr(recent_text.length() - 50);
+        if (!Feed({tok})) break;
+        ++generated;
 
-        context_tokens_.push_back(new_token_id);
-        llama_sampler_accept(smpl_, new_token_id);
+        // Reasoning ("thought" channel) is kept in the KV cache but never spoken.
+        if (piece.find("<|channel>") != std::string::npos) { in_thought = true; phrase.clear(); continue; }
+        if (piece.find("<channel|>") != std::string::npos) { in_thought = false; phrase.clear(); continue; }
+        if (in_thought) continue;
 
-        if (isRepetitive(recent_text, 5) && ++repetition_count > 2) break;
-        else if (!isRepetitive(recent_text, 5)) repetition_count = 0;
-
-        if (isCompleteSentence(current_phrase)) {
-            std::string cleaned = clean_response(current_phrase);
-            if (!cleaned.empty()) callback.OnResponseComplete(true, cleaned.c_str());
-            response += current_phrase;
-            current_phrase.clear();
-        }
-
-        llama_batch tok_batch = llama_batch_get_one(&new_token_id, 1);
-        if (llama_decode(ctx_, tok_batch)) { LOG_E("Decode failed in image loop."); break; }
-        n_past_++;
-        generated++;
+        phrase += piece;
+        recent += piece;
+        if (recent.size() > 64) recent.erase(0, recent.size() - 64);
+        if (isRepetitive(recent, 8)) { if (++repeats > 2) break; } else repeats = 0;
+        flush(false);
     }
-
-    if (!current_phrase.empty()) {
-        response += current_phrase;
-        std::string cleaned = clean_response(current_phrase);
-        if (!cleaned.empty()) callback.OnResponseComplete(true, cleaned.c_str());
-    }
-
+    if (!in_thought && continue_) flush(true);  // a barged-in turn drops its unfinished sentence
+    CloseTurn();
     return clean_response(response);
+}
+
+std::string LlamaSimpleChat::generate(const std::string &prompt,
+                                      WhillatsSetResponseCallback callback) {
+    if (!ctx_ || !vocab_ || !smpl_) { LOG_E("generate: not initialized"); return ""; }
+    continue_ = true;
+    _lastResponseStart = std::chrono::steady_clock::now();
+
+    std::vector<llama_token> toks = Tokenize(UserPrefix(), false, true);
+    // Small models drift back to the language of earlier turns; a per-turn
+    // reminder keeps non-Latin-script speakers (ru, uk, zh, ar, ...) answered in kind.
+    std::vector<llama_token> body = Tokenize(
+        IsMostlyNonLatin(prompt) ? prompt + "\n(Reply in the language of this message.)" : prompt, false, false);
+    std::vector<llama_token> tail = Tokenize(UserSuffix(), false, true);
+    toks.insert(toks.end(), body.begin(), body.end());
+    toks.insert(toks.end(), tail.begin(), tail.end());
+
+    if (!PrepareTurn((int)toks.size()) || !Feed(std::move(toks))) return "";
+    return RunTurn(callback, kMaxReplyTokens, 0);
+}
+
+std::string LlamaSimpleChat::generateFromImage(YUVData* yuv, const std::string& prompt,
+                                               WhillatsSetResponseCallback callback) {
+    if (!ctx_mtmd_ || !yuv || !yuv->y || !yuv->u || !yuv->v) return generate(prompt, callback);
+    if (!ctx_ || !vocab_ || !smpl_) { LOG_E("generateFromImage: not initialized"); return ""; }
+    continue_ = true;
+    _lastResponseStart = std::chrono::steady_clock::now();
+
+    int w = 0, h = 0;
+    std::vector<uint8_t> rgb = YuvToRgb(*yuv, kImageMaxSide, w, h);
+    if (rgb.empty()) return generate(prompt, callback);
+    mtmd::bitmap bitmap(w, h, rgb.data());
+    if (!bitmap.ptr) return generate(prompt, callback);
+
+    // User text cannot be parsed for specials here, so neutralise marker look-alikes.
+    const std::string marker = mtmd_default_marker();
+    std::string text = prompt;
+    for (const std::string& bad : {std::string("<|"), std::string("|>"), std::string("<start_of_turn>"),
+                                   std::string("<end_of_turn>"), marker}) {
+        for (size_t pos; (pos = text.find(bad)) != std::string::npos;) text.erase(pos, bad.size());
+    }
+    const std::string full = UserPrefix() + marker + "\n" + text + UserSuffix();
+    mtmd_input_text input_text = { full.c_str(), full.size(), false, true };
+    const mtmd_bitmap* bitmaps[] = { bitmap.ptr.get() };
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    if (!chunks.ptr || mtmd_tokenize(ctx_mtmd_.get(), chunks.ptr.get(), &input_text, bitmaps, 1) != 0) {
+        LOG_E("mtmd_tokenize failed");
+        return generate(prompt, callback);
+    }
+
+    if (!PrepareTurn((int)mtmd_helper_get_n_pos(chunks.ptr.get()))) return "";
+    llama_pos new_n_past = n_past_;
+    if (mtmd_helper_eval_chunks(ctx_mtmd_.get(), ctx_, chunks.ptr.get(), n_past_, 0,
+                                (int)llama_n_batch(ctx_), true, &new_n_past) != 0) {
+        LOG_E("mtmd eval failed");
+        BeginConversation();
+        return "";
+    }
+    n_past_ = new_n_past;
+    image_in_context_ = true;
+    return RunTurn(callback, kMaxImageReplyTokens, 4);
 }
 
 void LlamaSimpleChat::DetectStoppingTokens() {
@@ -689,13 +594,11 @@ void LlamaSimpleChat::DetectChatFormat() {
 // ============================================================================
 
 LlamaDeviceBase::LlamaDeviceBase(const char* model_path,
-                                  const char* mmproj_path,
-                                  WhillatsSetResponseCallback callback)
+                                 const char* mmproj_path,
+                                 WhillatsSetResponseCallback callback)
     : _model_path(model_path ? model_path : "")
     , _mmproj_path(mmproj_path ? mmproj_path : "")
     , _responseCallback(callback)
-    , _hasMultimodalModel(false)
-    , _imageRetentionMs(5000)
 {
     LOG_I("LlamaDeviceBase: model=" << _model_path
           << " mmproj=" << (_mmproj_path.empty() ? "(none)" : _mmproj_path));
@@ -706,26 +609,45 @@ LlamaDeviceBase::~LlamaDeviceBase() {
     stop();
 }
 
+void LlamaDeviceBase::setCallback(WhillatsSetResponseCallback cb) {
+    std::lock_guard<std::mutex> lk(_callbackMutex);
+    _responseCallback = cb;
+}
+
+void LlamaDeviceBase::setThreadCount(int n) {
+    _threadCount = n;
+    if (_chat && !_running) _chat->SetThreadCount(n);
+}
+
+void LlamaDeviceBase::resetConversation() {
+    if (_chat) _chat->StopGeneration();
+    std::lock_guard<std::mutex> lk(_queueMutex);
+    _requestQueue.clear();
+    _requestQueue.push_back({std::string(), nullptr});  // empty prompt = reset marker
+    _queueCondition.notify_one();
+}
+
 bool LlamaDeviceBase::start() {
     if (_running) return true;
+    if (_processingThread.joinable()) _processingThread.join();
 
-    _chat = std::make_unique<LlamaSimpleChat>();
-    _chat->SetModelPaths(_model_path, _mmproj_path);
-    _chat->SetNGL(32);
-
-    LOG_I("LlamaDeviceBase: loading model...");
-    if (!_chat->Initialize()) {
-        LOG_E("LlamaDeviceBase: model init failed");
-        _chat.reset();
-        return false;
-    }
-
-    // Detect multimodal support
-    if (!_mmproj_path.empty() && _chat->ctx_mtmd_) {
-        _hasMultimodalModel = mtmd_support_vision(_chat->ctx_mtmd_.get());
+    if (!_chat) {
+        auto chat = std::make_unique<LlamaSimpleChat>();
+        chat->SetModelPaths(_model_path, _mmproj_path);
+        if (_threadCount > 0) chat->SetThreadCount(_threadCount);
+        LOG_I("LlamaDeviceBase: loading model...");
+        if (!chat->Initialize()) { LOG_E("LlamaDeviceBase: model init failed"); return false; }
+        _chat = std::move(chat);
+        _hasMultimodalModel = _chat->ctx_mtmd_ && mtmd_support_vision(_chat->ctx_mtmd_.get());
         LOG_I("LlamaDeviceBase: multimodal=" << (_hasMultimodalModel ? "yes" : "no"));
+    } else if (_threadCount > 0) {
+        _chat->SetThreadCount(_threadCount);
     }
 
+    {
+        std::lock_guard<std::mutex> lk(_queueMutex);
+        _requestQueue.clear();
+    }
     _running = true;
     _processingThread = std::thread([this]() { RunProcessingThread(); });
     LOG_I("LlamaDeviceBase: started");
@@ -733,43 +655,38 @@ bool LlamaDeviceBase::start() {
 }
 
 void LlamaDeviceBase::stop() {
-    if (!_running) return;
-    _running = false;
+    if (!_running.exchange(false)) return;
     if (_chat) _chat->StopGeneration();
     _queueCondition.notify_all();
-    if (_processingThread.joinable()) {
-        if (std::this_thread::get_id() != _processingThread.get_id())
-            _processingThread.join();
-    }
+    if (_processingThread.joinable() && std::this_thread::get_id() != _processingThread.get_id())
+        _processingThread.join();
 }
 
 void LlamaDeviceBase::askLlama(const char* prompt) {
     if (!prompt || !*prompt || !_running) return;
-    if (_chat) _chat->StopGeneration();
+    if (_chat) _chat->StopGeneration();  // barge-in: newest utterance wins
 
-    Request req;
-    req.prompt = prompt;
-    req.yuv    = nullptr;
+    Request req{prompt, nullptr};
     if (_hasMultimodalModel) {
         std::lock_guard<std::mutex> lk(_frameMutex);
-        auto now = std::chrono::steady_clock::now();
-        if (_lastFrame && (now - _lastFrameTime) <= std::chrono::milliseconds(_imageRetentionMs)) {
-            req.yuv = _lastFrame;
+        if (_lastFrame && std::chrono::steady_clock::now() - _lastFrameTime <=
+                              std::chrono::milliseconds(_imageRetentionMs)) {
+            req.yuv = std::move(_lastFrame);  // each frame is sent once; KV keeps it afterwards
         }
     }
-
     {
         std::lock_guard<std::mutex> lk(_queueMutex);
-        _requestQueue.clear(); // cancel pending requests
+        _requestQueue.clear();
         _requestQueue.push_back(std::move(req));
     }
     _queueCondition.notify_one();
 }
 
 void LlamaDeviceBase::receiveVideoFrame(const YUVData& yuv) {
+    if (!_hasMultimodalModel) return;
     auto frame = std::make_shared<YUVData>();
-    frame->width  = yuv.width;
-    frame->height = yuv.height;
+    frame->width   = yuv.width;
+    frame->height  = yuv.height;
     frame->y_size  = yuv.y_size;
     frame->uv_size = yuv.uv_size;
     frame->y = std::make_unique<uint8_t[]>(yuv.y_size);
@@ -789,24 +706,24 @@ bool LlamaDeviceBase::RunProcessingThread() {
         Request req;
         {
             std::unique_lock<std::mutex> lk(_queueMutex);
-            _queueCondition.wait(lk, [this] {
-                return !_requestQueue.empty() || !_running;
-            });
+            _queueCondition.wait(lk, [this] { return !_requestQueue.empty() || !_running; });
             if (!_running) break;
-            if (_requestQueue.empty()) continue;
             req = std::move(_requestQueue.front());
             _requestQueue.pop_front();
         }
+        if (req.prompt.empty()) { _chat->ResetConversation(); continue; }
 
+        WhillatsSetResponseCallback cb(nullptr, nullptr);
+        {
+            std::lock_guard<std::mutex> lk(_callbackMutex);
+            cb = _responseCallback;
+        }
         LOG_I("LlamaDeviceBase: prompt='" << req.prompt.substr(0, 80) << "'"
               << (req.yuv ? " [+image]" : ""));
 
-        if (req.yuv && _hasMultimodalModel) {
-            _chat->generateFromImage(req.yuv.get(), req.prompt, _responseCallback);
-        } else {
-            _chat->generate(req.prompt, _responseCallback);
-        }
-        _responseCallback.OnResponseComplete(false, nullptr); // signal done
+        if (req.yuv) _chat->generateFromImage(req.yuv.get(), req.prompt, cb);
+        else         _chat->generate(req.prompt, cb);
+        cb.OnResponseComplete(false, nullptr);  // signal done
     }
     return true;
 }

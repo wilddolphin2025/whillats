@@ -73,7 +73,7 @@ FetchContent_Declare(
 FetchContent_Declare(
     llama
     GIT_REPOSITORY https://github.com/ggerganov/llama.cpp
-    GIT_TAG        master
+    GIT_TAG        b11019            # Gemma 4 (text + vision/audio mtmd) support
     SOURCE_DIR ${THIRD_PARTY_DIR}/llama.cpp
     GIT_SHALLOW TRUE # Faster clone
 )
@@ -333,21 +333,16 @@ endif()
 # --- mtmd example shared library ---
 find_package(Threads REQUIRED)
 
-file(GLOB MTMD_MODEL_SOURCES ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/models/*.cpp)
-add_library(mtmd OBJECT
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd.h
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd.cpp
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-audio.h
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-audio.cpp
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-image.cpp
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-image.h
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-helper.cpp
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/clip.cpp
-    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/clip.h
-    ${MTMD_MODEL_SOURCES}
-    )
+# Every mtmd source except the CLI entry points; the list grows with each
+# llama.cpp release (mtmd-image, mtmd-helper-gen, models/*), so glob it.
+file(GLOB MTMD_SOURCES
+    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/*.cpp
+    ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/models/*.cpp)
+list(FILTER MTMD_SOURCES EXCLUDE REGEX "/(mtmd-cli|deprecation-warning|mtmd-debug)[^/]*\\.cpp$")
+set(MTMD_VENDOR_LIBS vendor::hash vendor::miniaudio vendor::stb vendor::sheredom)
+add_library(mtmd OBJECT ${MTMD_SOURCES})
 
-target_link_libraries(mtmd PRIVATE ggml llama Threads::Threads)
+target_link_libraries(mtmd PRIVATE ggml llama Threads::Threads ${MTMD_VENDOR_LIBS})
 
 target_include_directories(mtmd PUBLIC
     ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd
@@ -366,7 +361,7 @@ set_target_properties(mtmd_shared PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 target_compile_definitions(mtmd_shared PRIVATE LLAMA_BUILD)
-target_link_libraries(mtmd_shared PRIVATE ggml llama Threads::Threads)
+target_link_libraries(mtmd_shared PRIVATE ggml llama Threads::Threads ${MTMD_VENDOR_LIBS})
 install(TARGETS mtmd_shared ARCHIVE)
 
 
@@ -581,15 +576,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # Build llama inline for iOS
     # Skip building llama here to avoid target name conflict - FetchContent already handles it
     # add_subdirectory(${THIRD_PARTY_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/_deps/llama-ios-build EXCLUDE_FROM_ALL)
-    # Build mtmd from source (no FetchContent) as object and static library
-    file(GLOB MTMD_IOS_MODEL_SOURCES ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/models/*.cpp)
-    add_library(mtmd_obj OBJECT
-        "${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd.cpp"
-        ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-helper.cpp
-        ${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/mtmd-audio.cpp        
-        "${THIRD_PARTY_DIR}/llama.cpp/tools/mtmd/clip.cpp"
-        ${MTMD_IOS_MODEL_SOURCES}
-    )
+    add_library(mtmd_obj OBJECT ${MTMD_SOURCES})
+    target_link_libraries(mtmd_obj PRIVATE ggml llama ${MTMD_VENDOR_LIBS})
     target_include_directories(mtmd_obj PRIVATE
         "${THIRD_PARTY_DIR}/llama.cpp/include"
         "${THIRD_PARTY_DIR}/llama.cpp/common"
@@ -617,7 +605,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE TTS_PLATFORMS=0 WEBRTC_IOS)
     # Link statically to whisper and llama for iOS to avoid dylib dependencies
-    target_link_libraries(${PROJECT_NAME} PRIVATE whisper llama $<TARGET_OBJECTS:mtmd_obj>
+    target_link_libraries(${PROJECT_NAME} PRIVATE whisper llama $<TARGET_OBJECTS:mtmd_obj> ${MTMD_VENDOR_LIBS}
         "-framework AVFoundation" "-framework Foundation" "-framework Accelerate"
         "-framework Metal" "-framework MetalKit" "-framework AudioToolbox"
         "-framework CoreAudio"
