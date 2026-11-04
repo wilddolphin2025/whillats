@@ -139,6 +139,8 @@ void WhillatsTTS::disableSpeakerphone() { _wrapper->disableSpeakerphone(); }
 void WhillatsTTS::setThreadCount(int) {}
 // The synthesizer wrapper holds &_callback, so updating it in place retargets audio.
 void WhillatsTTS::setCallback(WhillatsSetAudioCallback cb) { _callback = cb; }
+bool WhillatsTTS::setVoice(const char*) { return false; }
+void WhillatsTTS::interrupt() { stop(); }
 
 #elif defined(__APPLE__) && TARGET_OS_OSX
 #include "synthesis.h"
@@ -154,6 +156,8 @@ void WhillatsTTS::queueText(const char* t, const char* l) { _synth->queueText(st
 void WhillatsTTS::enableSpeakerphone() {}
 void WhillatsTTS::disableSpeakerphone() {}
 void WhillatsTTS::setThreadCount(int) {}
+bool WhillatsTTS::setVoice(const char*) { return false; }
+void WhillatsTTS::interrupt() { _synth->stop(); _synth->start(); }
 
 #else
 // Linux: always use whillats_server for TTS
@@ -174,6 +178,12 @@ void WhillatsTTS::setCallback(WhillatsSetAudioCallback cb) {
 }
 void WhillatsTTS::queueText(const char* t) { if (_ttsClient) _ttsClient->queueText(t, "en"); }
 void WhillatsTTS::queueText(const char* t, const char* l) { if (_ttsClient) _ttsClient->queueText(t, l); }
+bool WhillatsTTS::setVoice(const char* v) {
+    if (!_ttsClient || !v) return false;
+    _ttsClient->setVoice(v);
+    return true;
+}
+void WhillatsTTS::interrupt() { if (_ttsClient) _ttsClient->interrupt(); }
 int WhillatsTTS::getSampleRate() { return 16000; }
 void WhillatsTTS::setThreadCount(int) {}
 void WhillatsTTS::enableSpeakerphone() {}

@@ -29,6 +29,9 @@ set(CMAKE_FRAMEWORK_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/Frameworks/$<CONFIG>)
 # TTS engine selection (mutually exclusive)
 option(WHILLATS_PIPER "Enable Piper neural TTS engine (fast CPU, requires ONNX Runtime)" OFF)
 option(WHILLATS_STYLETTS2 "Enable StyleTTS2 neural TTS engine (requires ONNX Runtime)" ON)
+# Runs alongside the engine above: personalized (cloned) voice for the
+# languages its bundle covers. Needs CMake >= 3.28 for pocket-tts-raven.
+option(WHILLATS_POCKET_TTS "Enable Pocket TTS zero-shot voice cloning (Kyutai, via pocket-tts-raven)" OFF)
 
 if(WHILLATS_PIPER)
     set(WHILLATS_STYLETTS2 OFF CACHE BOOL "" FORCE)
@@ -101,9 +104,16 @@ if(UNIX AND NOT APPLE)
     )
 endif()
 
-# --- ONNX Runtime for StyleTTS2 ---
-if(WHILLATS_PIPER OR WHILLATS_STYLETTS2)
-    set(ONNXRUNTIME_VERSION "1.17.3" CACHE STRING "ONNX Runtime version to download")
+# --- ONNX Runtime for Piper / StyleTTS2 / Pocket TTS ---
+if(WHILLATS_PIPER OR WHILLATS_STYLETTS2 OR WHILLATS_POCKET_TTS)
+    # pocket-tts-raven needs ORT >= 1.23 and must share this copy: two ORT
+    # versions in one process collide on OrtGetApiBase.
+    if(WHILLATS_POCKET_TTS)
+        set(_whillats_ort_default "1.23.2")
+    else()
+        set(_whillats_ort_default "1.17.3")
+    endif()
+    set(ONNXRUNTIME_VERSION "${_whillats_ort_default}" CACHE STRING "ONNX Runtime version to download")
 
     # Check if user provided ONNXRUNTIME_DIR
     if(ONNXRUNTIME_DIR)
@@ -416,6 +426,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             src/styletts2_tts.cc
             src/orpheus_tts.cc)
     endif()
+    if(WHILLATS_POCKET_TTS)
+        set(BUILD_SHARED_LIB ON CACHE BOOL "Build libpocket_tts for whillats_server" FORCE)
+        add_subdirectory(third_party/pocket-tts-raven EXCLUDE_FROM_ALL)
+        list(APPEND WHILLATS_SERVER_SOURCES src/pocket_voice_tts.cc)
+        message(STATUS "TTS voice cloning: Pocket TTS")
+    endif()
     # Always include espeak TTS as fallback in server
     if(UNIX AND NOT APPLE)
         list(APPEND WHILLATS_SERVER_SOURCES src/espeak_tts.cc)
@@ -499,6 +515,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     endif()
 
     # Server links Whisper + Llama + TTS
+    if(WHILLATS_POCKET_TTS)
+        target_compile_definitions(whillats_server PRIVATE WHILLATS_POCKET_TTS)
+        target_include_directories(whillats_server PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pocket-tts-raven/include)
+        target_link_libraries(whillats_server PRIVATE pocket-tts-lib)
+    endif()
     target_link_libraries(whillats_server
         PRIVATE
             whisper

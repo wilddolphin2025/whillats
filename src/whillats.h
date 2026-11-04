@@ -141,6 +141,11 @@ class WHILLATS_API WhillatsTTS {
     void enableSpeakerphone();
     void disableSpeakerphone();
     void setCallback(WhillatsSetAudioCallback cb);
+    // Personalized voice: name of a reference clip known to the TTS server.
+    // Returns false when the build has no voice-cloning engine.
+    bool setVoice(const char* voice);
+    // Stops speaking now and drops queued text (barge-in).
+    void interrupt();
 
     static int getSampleRate();
 

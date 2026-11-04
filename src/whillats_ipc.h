@@ -28,6 +28,8 @@ enum MsgType : uint8_t {
     MSG_TTS_SPEAK          = 0x22,
     MSG_TTS_AUDIO          = 0x23,
     MSG_TTS_DONE           = 0x24,
+    MSG_TTS_VOICE          = 0x25,  // payload: voice clip name inside the voices dir
+    MSG_TTS_INTERRUPT      = 0x26,  // drop queued text, abort current utterance
 
     MSG_CONFIG             = 0x30,
     MSG_SHUTDOWN           = 0xFF,

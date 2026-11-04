@@ -21,6 +21,9 @@
 #include "styletts2_tts.h"
 #include "orpheus_tts.h"
 #endif
+#if defined(WHILLATS_POCKET_TTS)
+#include "pocket_voice_tts.h"
+#endif
 
 using namespace whillats_ipc;
 
@@ -114,6 +117,11 @@ int main(int argc, char* argv[]) {
 #else
     // espeak-ng fallback would go here
     void* tts = nullptr;
+#endif
+#if defined(WHILLATS_POCKET_TTS)
+    // Personalized voice for languages its bundle covers; the engine above
+    // handles every other language.
+    std::unique_ptr<PocketTTS> pocket;
 #endif
 
     ConfigMsg cfg{};
@@ -260,30 +268,58 @@ int main(int argc, char* argv[]) {
                 }
             }
 #endif
+#if defined(WHILLATS_POCKET_TTS)
+            if (!pocket) {
+                const char* models = getenv("POCKET_TTS_MODELS_DIR");
+                const char* voices = getenv("POCKET_TTS_VOICES_DIR");
+                if (models && voices) {
+                    const char* voice = getenv("POCKET_TTS_VOICE");
+                    const char* lang = getenv("POCKET_TTS_LANGUAGE");
+                    pocket = std::make_unique<PocketTTS>(ttsCb);
+                    if (!pocket->start(models, voices, voice ? voice : "",
+                                       lang ? lang : "en", cfg.tts_threads)) {
+                        pocket.reset();
+                    }
+                }
+            }
+#endif
             break;
         }
 
         case MSG_TTS_STOP:
             break;
 
-        case MSG_TTS_SPEAK: {
-#if defined(WHILLATS_PIPER) || defined(WHILLATS_STYLETTS2)
-            if (tts && h.len > 0) {
-                if (h.len >= 2) {
-                    uint16_t lang_len;
-                    memcpy(&lang_len, payload.data(), 2);
-                    if (2 + lang_len <= h.len) {
-                        std::vector<char> lang_buf(lang_len + 1, '\0');
-                        if (lang_len > 0) memcpy(lang_buf.data(), payload.data()+2, lang_len);
-
-                        size_t text_len = h.len - 2 - lang_len;
-                        std::vector<char> text_buf(text_len + 1, '\0');
-                        if (text_len > 0) memcpy(text_buf.data(), payload.data()+2+lang_len, text_len);
-
-                        tts->queueText(text_buf.data(), lang_buf.data());
-                    }
-                }
+        case MSG_TTS_VOICE: {
+#if defined(WHILLATS_POCKET_TTS)
+            if (pocket && h.len > 0) {
+                pocket->setVoice(std::string(payload.begin(), payload.end()));
             }
+#endif
+            break;
+        }
+
+        case MSG_TTS_INTERRUPT:
+#if defined(WHILLATS_POCKET_TTS)
+            if (pocket) pocket->interrupt();
+#endif
+            break;
+
+        case MSG_TTS_SPEAK: {
+            // payload: uint16 lang_len, lang, text
+            if (h.len < 2) break;
+            uint16_t lang_len;
+            memcpy(&lang_len, payload.data(), 2);
+            if (2u + lang_len > h.len) break;
+            const std::string lang(payload.begin() + 2, payload.begin() + 2 + lang_len);
+            const std::string text(payload.begin() + 2 + lang_len, payload.end());
+#if defined(WHILLATS_POCKET_TTS)
+            if (pocket && pocket->supportsLanguage(lang)) {
+                pocket->queueText(text.c_str(), lang.c_str());
+                break;
+            }
+#endif
+#if defined(WHILLATS_PIPER) || defined(WHILLATS_STYLETTS2)
+            if (tts) tts->queueText(text.c_str(), lang.c_str());
 #endif
             break;
         }
@@ -298,6 +334,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+#if defined(WHILLATS_POCKET_TTS)
+    if (pocket) pocket->stop();
+#endif
 #if defined(WHILLATS_PIPER) || defined(WHILLATS_STYLETTS2)
     if (tts) tts->stop();
 #endif

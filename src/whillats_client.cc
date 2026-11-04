@@ -281,3 +281,12 @@ void WhillatsTTSClient::queueText(const char* text, const char* language) {
     _conn.sendMsg(MSG_TTS_SPEAK, buf, total);
     free(buf);
 }
+
+void WhillatsTTSClient::setVoice(const char* voice) {
+    if (!_started || !voice) return;
+    _conn.sendMsg(MSG_TTS_VOICE, voice, (uint32_t)strlen(voice));
+}
+
+void WhillatsTTSClient::interrupt() {
+    if (_started) _conn.sendMsg(MSG_TTS_INTERRUPT, nullptr, 0);
+}

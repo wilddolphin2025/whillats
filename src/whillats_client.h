@@ -102,6 +102,8 @@ public:
     bool start();
     void stop();
     void queueText(const char* text, const char* language);
+    void setVoice(const char* voice);
+    void interrupt();
     static int getSampleRate() { return 16000; }
 
 private:

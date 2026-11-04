@@ -79,6 +79,8 @@ Length-prefixed binary messages over Unix pipes (fork/exec on first use):
 | MSG_TTS_SPEAK | 0x22 | client→server | Text + language tag |
 | MSG_TTS_AUDIO | 0x23 | server→client | PCM int16 audio |
 | MSG_TTS_DONE | 0x24 | server→client | Synthesis complete |
+| MSG_TTS_VOICE | 0x25 | client→server | Select a cloned voice (clip name in `POCKET_TTS_VOICES_DIR`) |
+| MSG_TTS_INTERRUPT | 0x26 | client→server | Drop queued text, abort current utterance (barge-in) |
 | MSG_SHUTDOWN | 0xFF | client→server | Shutdown server |
 
 **Note:** `MSG_CONFIG.llama_model` field carries the llama-server URL (e.g. `http://127.0.0.1:8080`) rather than a model file path.
@@ -179,6 +181,7 @@ Browser video track (when enabled) → `MSG_LLAMA_VIDEO_FRAME` → `LlamaDeviceB
 | `piper_tts.h/cc` | Piper TTS controller: per-language subprocess routing |
 | `piper_subprocess.h/cc` | Piper ONNX isolation via fork (closes inherited fds) |
 | `styletts2_tts.h/cc` | StyleTTS2 neural TTS (ONNX, alternative to Piper) |
+| `pocket_voice_tts.h/cc` | Pocket TTS zero-shot voice cloning (`WHILLATS_POCKET_TTS`, pocket-tts-raven runtime) |
 | `espeak_tts.h/cc` | espeak-ng rule-based TTS fallback |
 | `whisper_helpers.h` | Logging macros (stderr only), timing |
 
@@ -193,3 +196,22 @@ Browser video track (when enabled) → `MSG_LLAMA_VIDEO_FRAME` → `LlamaDeviceB
 | whillats_server cold start | ~1s (Whisper preloads in background) |
 
 Models preload at startup. llama-server and whillats_server start independently; directcall waits for llama-server via `/health` polling (up to 60s).
+
+## Personalized Voices (Pocket TTS)
+
+Build with `-DWHILLATS_POCKET_TTS=ON` (CMake ≥ 3.28). `whillats_server` then
+loads Kyutai's Pocket TTS (100M parameters, weights CC-BY-4.0) through the MIT
+[pocket-tts-raven](https://github.com/pkalogiros/pocket-tts-raven) ONNX runtime
+next to Piper/StyleTTS2:
+
+| Variable | Meaning |
+|----------|---------|
+| `POCKET_TTS_MODELS_DIR` | Bundle from `third_party/pocket-tts-raven/tools/prepare_models.sh` |
+| `POCKET_TTS_VOICES_DIR` | Reference clips (6–15 s of one consenting speaker, wav/mp3) |
+| `POCKET_TTS_VOICE` | Default clip name |
+| `POCKET_TTS_LANGUAGE` | Bundle language (default `en`); other languages fall back to Piper |
+
+The clip is encoded once (cached in `voices/.cache/`), so switching voices
+mid-call costs one background encode. Output is 24 kHz and converted to the
+pipeline's 16 kHz with an anti-aliasing filter. `MSG_TTS_INTERRUPT` aborts
+generation within one decode batch, which makes barge-in immediate.
