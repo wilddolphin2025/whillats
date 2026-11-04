@@ -449,8 +449,8 @@
     const WS_ENDPOINTS = queryWs ? [queryWs] : DEFAULT_WS_ENDPOINTS;
     const ICE_SERVERS = [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'turn:turn.wilddolphin.us:3478?transport=udp', username: 'webrtcsays.ai', credential: 'wilddolphin' },
-        { urls: 'turn:turn.wilddolphin.us:5349?transport=tcp', username: 'webrtcsays.ai', credential: 'wilddolphin' }
+        { urls: 'turn:turn.wilddolphin.us:3478?transport=udp', username: '__TURN_USER__', credential: '__TURN_PASS__' },
+        { urls: 'turn:turn.wilddolphin.us:5349?transport=tcp', username: '__TURN_USER__', credential: '__TURN_PASS__' }
     ];
 
     let ws = null;
