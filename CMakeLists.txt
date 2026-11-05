@@ -429,6 +429,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     if(WHILLATS_POCKET_TTS)
         set(BUILD_SHARED_LIB ON CACHE BOOL "Build libpocket_tts for whillats_server" FORCE)
         add_subdirectory(third_party/pocket-tts-raven EXCLUDE_FROM_ALL)
+        # Raven's own include path uses CMAKE_SOURCE_DIR, which is this
+        # project when it is added as a subdirectory, so pocket_tts.h is missed.
+        target_include_directories(pocket-tts-lib PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pocket-tts-raven/include)
         list(APPEND WHILLATS_SERVER_SOURCES src/pocket_voice_tts.cc)
         message(STATUS "TTS voice cloning: Pocket TTS")
     endif()
