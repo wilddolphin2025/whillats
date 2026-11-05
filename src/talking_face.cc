@@ -24,9 +24,14 @@ bool TalkingFace::loadImage(const char* imagePath) {
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> buf(len);
-    fread(buf.data(), 1, len, f);
+    if (len <= 0) {
+        fclose(f);
+        return false;
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(len));
+    const size_t nread = fread(buf.data(), 1, buf.size(), f);
     fclose(f);
+    if (nread != buf.size()) return false;
 
     return loadImageFromMemory(buf.data(), (int)buf.size(), 0, 0);
 }
